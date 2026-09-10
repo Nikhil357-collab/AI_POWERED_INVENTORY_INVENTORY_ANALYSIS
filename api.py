@@ -588,6 +588,286 @@ def handle_exception(e):
 
 
 # ============================================================
+# DASHBOARD DATA - FILTERING, RANKING & ACTION ENGINE
+# ============================================================
+
+def _first_col(df, names):
+    for name in names:
+        if name in df.columns:
+            return name
+    return None
+
+
+def _num_series(df, col, default=0.0):
+    if col not in df.columns:
+        return pd.Series(default, index=df.index, dtype=float)
+    return pd.to_numeric(df[col], errors="coerce").fillna(default)
+
+
+def build_dashboard_data():
+    """Build one compact, deployment-safe dataset for the browser dashboard."""
+    forecast = load_csv("forecast")
+    risk = load_csv("risk")
+    master = load_csv("sku_master")
+
+    if forecast.empty and risk.empty:
+        return pd.DataFrame(), pd.DataFrame(), {}
+
+    # ---------- Product master ----------
+    m = master.copy()
+    if not m.empty and "sku_id" in m.columns:
+        m["sku_id"] = m["sku_id"].astype(str)
+        keep = [c for c in ["sku_id", "sku_name", "category", "subcategory", "brand", "unit_price", "cost_price"] if c in m.columns]
+        m = m[keep].drop_duplicates("sku_id")
+
+    # ---------- Forecast aggregation ----------
+    f = forecast.copy()
+    if not f.empty:
+        f["sku_id"] = f["sku_id"].astype(str) if "sku_id" in f.columns else "UNKNOWN"
+        if "store_id" not in f.columns:
+            f["store_id"] = "ALL"
+        f["store_id"] = f["store_id"].astype(str)
+        f["prediction"] = _num_series(f, "prediction")
+        if "units_sold" in f.columns:
+            f["units_sold"] = _num_series(f, "units_sold")
+        else:
+            f["units_sold"] = 0.0
+        if "date" in f.columns:
+            f["date"] = pd.to_datetime(f["date"], errors="coerce")
+
+        group_cols = ["store_id", "sku_id"]
+        agg = f.groupby(group_cols, as_index=False).agg(
+            forecast_units=("prediction", "sum"),
+            actual_units=("units_sold", "sum"),
+            avg_daily_forecast=("prediction", "mean"),
+            forecast_days=("prediction", "count"),
+        )
+    else:
+        agg = pd.DataFrame(columns=["store_id", "sku_id", "forecast_units", "actual_units", "avg_daily_forecast", "forecast_days"])
+
+    # ---------- Risk ----------
+    r = risk.copy()
+    if not r.empty:
+        if "sku_id" in r.columns:
+            r["sku_id"] = r["sku_id"].astype(str)
+        else:
+            r["sku_id"] = "UNKNOWN"
+        if "store_id" not in r.columns:
+            r["store_id"] = "ALL"
+        r["store_id"] = r["store_id"].astype(str)
+        risk_type_col = _first_col(r, ["risk_type", "risk_level"])
+        if risk_type_col:
+            r["risk_type_clean"] = r[risk_type_col].astype(str).str.upper()
+        else:
+            r["risk_type_clean"] = "NORMAL"
+
+        for c in ["risk_score", "stockout_value", "overstock_value", "reorder_qty", "shortage_units", "excess_units", "stock_on_hand", "unit_price", "cost_price"]:
+            if c in r.columns:
+                r[c] = _num_series(r, c)
+
+        # Prefer the strongest risk row per store/SKU.
+        if "risk_score" in r.columns:
+            r = r.sort_values("risk_score", ascending=False)
+        r = r.drop_duplicates(["store_id", "sku_id"], keep="first")
+        risk_keep = [c for c in [
+            "store_id", "sku_id", "risk_type_clean", "risk_score", "priority",
+            "recommended_action", "stockout_value", "overstock_value", "reorder_qty",
+            "shortage_units", "excess_units", "stock_on_hand", "reorder_point", "safety_stock"
+        ] if c in r.columns]
+        r = r[risk_keep]
+    else:
+        r = pd.DataFrame(columns=["store_id", "sku_id", "risk_type_clean", "risk_score"])
+
+    # ---------- Combine ----------
+    if agg.empty:
+        base = r.copy()
+    elif r.empty:
+        base = agg.copy()
+    else:
+        base = agg.merge(r, on=["store_id", "sku_id"], how="outer")
+
+    if "sku_id" not in base.columns:
+        base["sku_id"] = "UNKNOWN"
+    if "store_id" not in base.columns:
+        base["store_id"] = "ALL"
+    base["sku_id"] = base["sku_id"].astype(str)
+    base["store_id"] = base["store_id"].astype(str)
+
+    if not m.empty:
+        base = base.merge(m, on="sku_id", how="left", suffixes=("", "_master"))
+
+    for c in ["forecast_units", "actual_units", "avg_daily_forecast", "risk_score", "stockout_value", "overstock_value", "reorder_qty", "shortage_units", "excess_units", "stock_on_hand", "unit_price", "cost_price"]:
+        if c in base.columns:
+            base[c] = _num_series(base, c)
+
+    for c in ["sku_name", "category", "subcategory", "brand"]:
+        if c not in base.columns:
+            base[c] = "Unknown"
+        base[c] = base[c].fillna("Unknown").astype(str)
+
+    base["unit_price"] = _num_series(base, "unit_price")
+    base["cost_price"] = _num_series(base, "cost_price")
+    base["forecast_revenue"] = base.get("forecast_units", 0) * base["unit_price"]
+    base["forecast_profit"] = base.get("forecast_units", 0) * (base["unit_price"] - base["cost_price"])
+    base["actual_revenue"] = base.get("actual_units", 0) * base["unit_price"]
+    base["profit_margin_pct"] = np.where(
+        base["forecast_revenue"] > 0,
+        (base["forecast_profit"] / base["forecast_revenue"]) * 100,
+        0,
+    )
+
+    # ---------- Transparent business action ----------
+    existing_action = base.get("recommended_action", pd.Series("", index=base.index)).fillna("").astype(str).str.upper()
+    risk_type = base.get("risk_type_clean", pd.Series("NORMAL", index=base.index)).fillna("NORMAL").astype(str).str.upper()
+    score = _num_series(base, "risk_score")
+    reorder_qty = _num_series(base, "reorder_qty")
+    excess = _num_series(base, "excess_units")
+
+    def infer_action(row):
+        action = str(row.get("recommended_action", "")).upper().strip()
+        if action and action not in {"NAN", "NONE", "NO ACTION"}:
+            return action
+        rt = str(row.get("risk_type_clean", "NORMAL")).upper()
+        rs = float(row.get("risk_score", 0) or 0)
+        rq = float(row.get("reorder_qty", 0) or 0)
+        ex = float(row.get("excess_units", 0) or 0)
+        if rt == "STOCKOUT" or rq > 0:
+            return "URGENT REORDER" if rs >= 75 else "REORDER"
+        if rt == "OVERSTOCK" or ex > 0:
+            return "URGENT MARKDOWN" if rs >= 75 else "MARKDOWN / SELL NOW"
+        if rs >= 50:
+            return "WATCH CLOSELY"
+        return "NO ACTION"
+
+    base["action"] = base.apply(infer_action, axis=1)
+    base["red_flag"] = np.where(
+        (risk_type.isin(["STOCKOUT", "OVERSTOCK"])) | (score >= 75),
+        "RED FLAG",
+        np.where(score >= 50, "WATCH", "OK"),
+    )
+    base["value_at_stake"] = _num_series(base, "stockout_value") + _num_series(base, "overstock_value")
+
+    # Ranking at product level (across stores).
+    product = base.groupby(["sku_id", "sku_name", "category", "subcategory", "brand"], as_index=False).agg(
+        forecast_units=("forecast_units", "sum"),
+        actual_units=("actual_units", "sum"),
+        forecast_revenue=("forecast_revenue", "sum"),
+        forecast_profit=("forecast_profit", "sum"),
+        value_at_stake=("value_at_stake", "sum"),
+        stockout_value=("stockout_value", "sum"),
+        overstock_value=("overstock_value", "sum"),
+        max_risk_score=("risk_score", "max"),
+    )
+    product["profit_margin_pct"] = np.where(product["forecast_revenue"] > 0, product["forecast_profit"] / product["forecast_revenue"] * 100, 0)
+    product["red_flag"] = np.where(product["max_risk_score"] >= 75, "RED FLAG", np.where(product["max_risk_score"] >= 50, "WATCH", "OK"))
+
+    meta = {
+        "categories": sorted([x for x in base["category"].dropna().unique().tolist() if x not in ["", "Unknown"]]),
+        "stores": sorted([x for x in base["store_id"].dropna().unique().tolist() if x not in ["", "Unknown"]]),
+        "risk_types": sorted([x for x in base["risk_type_clean"].dropna().unique().tolist()]),
+        "actions": sorted([x for x in base["action"].dropna().unique().tolist()]),
+        "skus": sorted(base["sku_id"].dropna().unique().tolist())[:10000],
+    }
+    return base, product, meta
+
+
+@app.get("/dashboard_data")
+def dashboard_data():
+    """Single endpoint used by the Flask dashboard; avoids many browser API calls."""
+    try:
+        base, product, meta = build_dashboard_data()
+        if base.empty:
+            return jsonify({"data": [], "products": [], "meta": meta, "count": 0})
+
+        # Filters
+        category = request.args.get("category", "").strip()
+        sku = request.args.get("sku_id", "").strip()
+        store = request.args.get("store_id", "").strip()
+        risk_type = request.args.get("risk_type", "").strip().upper()
+        action = request.args.get("action", "").strip().upper()
+        red_flag = request.args.get("red_flag", "").strip().upper()
+        ranking = request.args.get("ranking", "revenue").strip().lower()
+        sort_dir = request.args.get("sort", "desc").strip().lower()
+        limit = get_limit(default=250, maximum=3000)
+
+        if category:
+            base = base[base["category"].str.casefold() == category.casefold()]
+        if sku:
+            base = base[base["sku_id"].astype(str) == sku]
+        if store:
+            base = base[base["store_id"].astype(str) == store]
+        if risk_type:
+            base = base[base["risk_type_clean"].astype(str).str.upper() == risk_type]
+        if action:
+            base = base[base["action"].astype(str).str.upper() == action]
+        if red_flag:
+            base = base[base["red_flag"].astype(str).str.upper() == red_flag]
+
+        # Product table follows the same filters where relevant.
+        if category:
+            product = product[product["category"].str.casefold() == category.casefold()]
+        if sku:
+            product = product[product["sku_id"].astype(str) == sku]
+
+        rank_col = {
+            "revenue": "forecast_revenue",
+            "profit": "forecast_profit",
+            "low_profit": "forecast_profit",
+            "risk": "max_risk_score",
+            "value": "value_at_stake",
+        }.get(ranking, "forecast_revenue")
+        ascending = sort_dir == "asc"
+        product = product.sort_values(rank_col, ascending=ascending).head(50)
+
+        base = base.sort_values(["red_flag", "risk_score", "value_at_stake"], ascending=[True, False, False]).head(limit)
+
+        # KPI calculations on the filtered base.
+        kpis = {
+            "products": int(base["sku_id"].nunique()),
+            "store_sku": int(len(base)),
+            "forecast_units": float(base["forecast_units"].sum()),
+            "revenue": float(base["forecast_revenue"].sum()),
+            "profit": float(base["forecast_profit"].sum()),
+            "value_at_stake": float(base["value_at_stake"].sum()),
+            "stockout_value": float(base["stockout_value"].sum()),
+            "overstock_value": float(base["overstock_value"].sum()),
+            "red_flags": int((base["red_flag"] == "RED FLAG").sum()),
+            "reorder": int(base["action"].str.contains("REORDER", na=False).sum()),
+            "markdown": int(base["action"].str.contains("MARKDOWN|SELL NOW", regex=True, na=False).sum()),
+        }
+
+        risk_counts = base["risk_type_clean"].value_counts().to_dict()
+        action_counts = base["action"].value_counts().to_dict()
+
+        # Keep response compact and JSON-safe.
+        columns = [c for c in [
+            "store_id", "sku_id", "sku_name", "category", "subcategory", "brand",
+            "forecast_units", "actual_units", "forecast_revenue", "forecast_profit",
+            "profit_margin_pct", "stock_on_hand", "risk_type_clean", "risk_score",
+            "priority", "reorder_qty", "shortage_units", "excess_units", "stockout_value",
+            "overstock_value", "value_at_stake", "action", "red_flag"
+        ] if c in base.columns]
+        pcols = [c for c in [
+            "sku_id", "sku_name", "category", "subcategory", "brand", "forecast_units",
+            "actual_units", "forecast_revenue", "forecast_profit", "profit_margin_pct",
+            "value_at_stake", "stockout_value", "overstock_value", "max_risk_score", "red_flag"
+        ] if c in product.columns]
+
+        return jsonify({
+            "data": clean_records(base[columns]),
+            "products": clean_records(product[pcols]),
+            "meta": meta,
+            "kpis": kpis,
+            "risk_counts": {str(k): int(v) for k, v in risk_counts.items()},
+            "action_counts": {str(k): int(v) for k, v in action_counts.items()},
+            "count": int(len(base)),
+        })
+    except Exception as e:
+        print("DASHBOARD DATA ERROR:", repr(e))
+        return jsonify({"error": "Dashboard data error", "message": str(e), "data": [], "products": [], "meta": {}}), 200
+
+
+# ============================================================
 # FLASK DASHBOARD
 # ============================================================
 
@@ -597,245 +877,106 @@ DASHBOARD_HTML = r"""
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>NORTHBAY FORESIGHT</title>
+<title>NORTHBAY FORESIGHT | AI Retail Control Tower</title>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 <style>
-body{font-family:Arial,sans-serif;margin:0;background:#f5f7fb;color:#172033}
-.wrap{max-width:1400px;margin:auto;padding:24px}
-h1{margin-bottom:4px}.muted{color:#64748b}
-.cards{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:22px 0}
-.card{background:white;padding:18px;border-radius:14px;box-shadow:0 2px 10px #00000010}
-.value{font-size:26px;font-weight:700;margin-top:7px}
-.controls{background:white;padding:18px;border-radius:14px;margin-bottom:18px}
-input,button{padding:10px;border:1px solid #d7dce5;border-radius:8px;margin:4px}
-button{cursor:pointer;background:#172033;color:white}
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
-.panel{background:white;border-radius:14px;padding:18px;margin-bottom:18px}
-.chart{height:390px}
-table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{padding:9px;border-bottom:1px solid #e8ebf0;text-align:left}
-th{background:#f8fafc}
-.status-ok{color:#16803c}.status-error{color:#b42318}
-@media(max-width:900px){.cards,.grid{grid-template-columns:1fr 1fr}}
-@media(max-width:600px){.cards,.grid{grid-template-columns:1fr}}
+:root{
+  --bg:rgb(8,12,24); --panel:rgb(17,24,39); --panel2:rgb(23,32,52);
+  --text:rgb(241,245,249); --muted:rgb(148,163,184); --line:rgb(51,65,85);
+  --cyan:rgb(34,211,238); --green:rgb(52,211,153); --amber:rgb(251,191,36);
+  --red:rgb(248,113,113); --blue:rgb(96,165,250); --purple:rgb(167,139,250);
+}
+*{box-sizing:border-box} body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:linear-gradient(135deg,rgb(7,12,25),rgb(15,23,42),rgb(12,20,38));color:var(--text)}
+.wrap{max-width:1500px;margin:auto;padding:24px}.hero{padding:26px;border:1px solid var(--line);border-radius:22px;background:linear-gradient(135deg,rgb(17,24,39),rgb(22,32,55));box-shadow:0 18px 50px rgba(0,0,0,.28)}
+h1{margin:0;font-size:30px}.sub{color:var(--muted);margin-top:7px}.status{display:inline-flex;margin-top:15px;padding:7px 12px;border-radius:999px;background:rgb(22,101,52);color:white;font-size:13px}.status.warn{background:rgb(146,64,14)}
+.filters{margin-top:18px;display:grid;grid-template-columns:repeat(7,minmax(120px,1fr));gap:10px}.filters select,.filters input{width:100%;padding:11px;border-radius:11px;border:1px solid var(--line);background:rgb(15,23,42);color:var(--text);outline:none}.filters button{padding:11px;border:0;border-radius:11px;background:linear-gradient(135deg,rgb(6,182,212),rgb(59,130,246));color:white;font-weight:700;cursor:pointer}.btn2{background:rgb(51,65,85)!important}
+.kpis{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin:16px 0}.kpi{background:linear-gradient(145deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:17px;padding:16px}.kpi small{color:var(--muted)}.kpi b{display:block;font-size:22px;margin-top:6px}.danger b{color:var(--red)}.good b{color:var(--green)}.money b{color:var(--cyan)}
+.grid{display:grid;grid-template-columns:1.2fr 1fr;gap:14px}.card{background:rgba(17,24,39,.88);border:1px solid var(--line);border-radius:18px;padding:16px;margin-bottom:14px}.card h2{font-size:17px;margin:0 0 12px}.chart{height:330px}.wide{grid-column:1/-1}.tablewrap{overflow:auto;max-height:430px;border:1px solid var(--line);border-radius:12px}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:10px;border-bottom:1px solid rgb(30,41,59);white-space:nowrap;text-align:left}th{position:sticky;top:0;background:rgb(15,23,42);z-index:1;color:var(--muted)}tr:hover{background:rgb(30,41,59)}.red{color:var(--red);font-weight:800}.green{color:var(--green);font-weight:700}.amber{color:var(--amber);font-weight:700}.pill{padding:4px 8px;border-radius:999px;background:rgb(51,65,85)}.note{color:var(--muted);font-size:12px;line-height:1.5}.error{color:var(--red)}
+@media(max-width:1100px){.filters{grid-template-columns:repeat(3,1fr)}.kpis{grid-template-columns:repeat(3,1fr)}.grid{grid-template-columns:1fr}}@media(max-width:650px){.wrap{padding:12px}.filters{grid-template-columns:1fr 1fr}.kpis{grid-template-columns:1fr 1fr}}
 </style>
 </head>
 <body>
 <div class="wrap">
-<h1>📦 NORTHBAY FORESIGHT</h1>
-<div class="muted">AI-powered demand forecasting and inventory decision intelligence</div>
+ <section class="hero">
+  <h1>NorthBay Foresight — AI Retail Control Tower</h1>
+  <div class="sub">Demand forecast • revenue & profit ranking • inventory risk • action recommendations</div>
+  <span id="status" class="status">Connecting…</span>
+  <div class="filters">
+   <select id="category"><option value="">All Categories</option></select>
+   <select id="sku"><option value="">All Product / SKU</option></select>
+   <select id="store"><option value="">All Stores</option></select>
+   <select id="risk"><option value="">All Risk Types</option></select>
+   <select id="action"><option value="">All Actions</option></select>
+   <select id="flag"><option value="">All Flags</option><option>RED FLAG</option><option>WATCH</option><option>OK</option></select>
+   <select id="ranking"><option value="revenue">Highest Revenue</option><option value="profit">Highest Profit</option><option value="low_profit">Lowest Profit</option><option value="risk">Highest Risk</option><option value="value">Highest Value at Stake</option></select>
+   <input id="search" placeholder="Search product name / brand">
+   <button onclick="loadDashboard()">Apply Filters</button>
+   <button class="btn2" onclick="resetFilters()">Reset</button>
+  </div>
+ </section>
 
-<div class="controls">
-<b>Filters</b><br>
-<label>SKU ID:
-<input id="sku" placeholder="e.g. SKU00001">
-</label>
-<label>Store ID:
-<input id="store" placeholder="Optional">
-</label>
-<button onclick="loadAll()">Apply</button>
-<button onclick="resetFilters()">Reset</button>
-<span id="status" class="muted">Connecting...</span>
-</div>
+ <section class="kpis">
+  <div class="kpi"><small>Products</small><b id="kProducts">—</b></div>
+  <div class="kpi"><small>Forecast Units</small><b id="kUnits">—</b></div>
+  <div class="kpi money"><small>Forecast Revenue</small><b id="kRevenue">—</b></div>
+  <div class="kpi good"><small>Forecast Profit</small><b id="kProfit">—</b></div>
+  <div class="kpi danger"><small>Value at Stake</small><b id="kStake">—</b></div>
+  <div class="kpi danger"><small>Red Flags</small><b id="kFlags">—</b></div>
+ </section>
 
-<div class="cards">
-<div class="card">Forecast Records<div id="forecastCount" class="value">—</div></div>
-<div class="card">Stockout Risk<div id="stockout" class="value">—</div></div>
-<div class="card">Overstock Risk<div id="overstock" class="value">—</div></div>
-<div class="card">Value at Stake<div id="value" class="value">—</div></div>
-</div>
+ <div class="grid">
+  <section class="card"><h2>Revenue vs Profit — Top Products</h2><div id="productChart" class="chart"></div></section>
+  <section class="card"><h2>Risk Distribution</h2><div id="riskChart" class="chart"></div></section>
+  <section class="card"><h2>Business Actions</h2><div id="actionChart" class="chart"></div></section>
+  <section class="card"><h2>Value at Stake</h2><div id="valueChart" class="chart"></div></section>
 
-<div class="grid">
-<div class="panel"><h3>💰 Value at Stake</h3><div id="valueChart" class="chart"></div></div>
-<div class="panel"><h3>🚨 Risk Distribution</h3><div id="riskChart" class="chart"></div></div>
+  <section class="card wide"><h2>🚨 Priority Decision Grid — what to do now</h2><div class="note">REORDER = stock is at risk; MARKDOWN / SELL NOW = excess inventory needs faster sales; WATCH = monitor closely; NO ACTION = currently stable. Red Flag means immediate attention.</div><div id="decisionTable" class="tablewrap"></div></section>
+  <section class="card wide"><h2>🏆 Product Ranking</h2><div id="productTable" class="tablewrap"></div></section>
+ </div>
 </div>
-
-<div class="panel">
-<h3>📈 Demand Forecast</h3>
-<div id="forecastChart" class="chart"></div>
-</div>
-
-<div class="panel">
-<h3>🔴 Reorder Priority</h3>
-<div id="reorderTable">Loading...</div>
-</div>
-
-<div class="panel">
-<h3>🟠 Markdown Priority</h3>
-<div id="markdownTable">Loading...</div>
-</div>
-
-<div class="panel">
-<h3>🚨 Risk Analysis</h3>
-<div id="riskTable">Loading...</div>
-</div>
-</div>
-
 <script>
-function money(x){
-    return "₹" + Number(x || 0).toLocaleString("en-IN",{maximumFractionDigits:0});
+const $=id=>document.getElementById(id);
+const money=x=>'₹'+Number(x||0).toLocaleString('en-IN',{maximumFractionDigits:0});
+const num=x=>Number(x||0).toLocaleString('en-IN',{maximumFractionDigits:1});
+let allProducts=[];
+function fill(id, values, label){const el=$(id); const first=el.options[0]; el.innerHTML=''; el.appendChild(first); values.forEach(v=>{let o=document.createElement('option');o.value=v;o.textContent=v;el.appendChild(o)});}
+function setK(id,v){$(id).textContent=v}
+function tableHtml(rows, product=false){
+ if(!rows||!rows.length)return '<div style="padding:20px;color:rgb(148,163,184)">No records match the selected filters.</div>';
+ const cols=product?['sku_id','sku_name','category','forecast_units','forecast_revenue','forecast_profit','profit_margin_pct','value_at_stake','max_risk_score','red_flag']:['store_id','sku_id','sku_name','category','forecast_units','forecast_revenue','forecast_profit','risk_type_clean','risk_score','stock_on_hand','reorder_qty','action','value_at_stake','red_flag'];
+ let h='<table><thead><tr>'+cols.map(c=>'<th>'+c.replaceAll('_',' ').toUpperCase()+'</th>').join('')+'</tr></thead><tbody>';
+ rows.forEach(r=>{h+='<tr>'+cols.map(c=>{let v=r[c];if(['forecast_revenue','forecast_profit','value_at_stake'].includes(c))v=money(v);else if(['forecast_units','stock_on_hand','reorder_qty'].includes(c))v=num(v);else if(['risk_score','max_risk_score','profit_margin_pct'].includes(c))v=num(v)+'%';let cls=(String(v).includes('RED FLAG')||String(r.action||'').includes('URGENT'))?'red':(String(r.action||'').includes('MARKDOWN')?'amber':(String(r.action||'').includes('REORDER')?'red':''));return '<td class="'+cls+'">'+(v??'—')+'</td>'}).join('')+'</tr>'});
+ return h+'</tbody></table>';
 }
-
-function params(){
-    const p = new URLSearchParams();
-    const sku = document.getElementById("sku").value.trim();
-    const store = document.getElementById("store").value.trim();
-
-    if(sku) p.set("sku_id",sku);
-    if(store) p.set("store_id",store);
-
-    return p.toString();
+function plot(id,data,layout){if(typeof Plotly==='undefined'){return} Plotly.newPlot(id,data,layout,{responsive:true,displayModeBar:false});}
+async function loadDashboard(){
+ const q=new URLSearchParams(); ['category','sku','store','risk','action','flag','ranking'].forEach(id=>{let v=$(id).value;if(v)q.set(id==='risk'?'risk_type':id==='flag'?'red_flag':id==='sku'?'sku_id':id,v)});
+ q.set('limit','1000');
+ $('status').textContent='Loading filtered data…'; $('status').className='status';
+ try{
+  const res=await fetch('/dashboard_data?'+q.toString()); const json=await res.json();
+  if(!res.ok)throw new Error('HTTP '+res.status);
+  if(json.error)throw new Error(json.message||json.error);
+  const k=json.kpis||{}; setK('kProducts',num(k.products));setK('kUnits',num(k.forecast_units));setK('kRevenue',money(k.revenue));setK('kProfit',money(k.profit));setK('kStake',money(k.value_at_stake));setK('kFlags',num(k.red_flags));
+  $('status').textContent='✓ Dashboard connected • '+num(json.count)+' filtered store-SKU records'; $('status').className='status';
+  if(json.meta){
+   if(!$('category').dataset.loaded){fill('category',json.meta.categories||[]);fill('store',json.meta.stores||[]);fill('risk',json.meta.risk_types||[]);fill('action',json.meta.actions||[]);fill('sku',json.meta.skus||[]);$('category').dataset.loaded='1';}
+  }
+  const products=json.products||[];
+  plot('productChart',[{x:products.slice(0,12).map(x=>x.sku_id),y:products.slice(0,12).map(x=>x.forecast_revenue),type:'bar',name:'Revenue'},{x:products.slice(0,12).map(x=>x.sku_id),y:products.slice(0,12).map(x=>x.forecast_profit),type:'bar',name:'Profit'}],{barmode:'group',margin:{t:10,l:65,r:10,b:70},paper_bgcolor:'transparent',plot_bgcolor:'transparent',font:{color:'rgb(226,232,240)'},yaxis:{tickprefix:'₹'}});
+  const rc=json.risk_counts||{};plot('riskChart',[{labels:Object.keys(rc),values:Object.values(rc),type:'pie',hole:.55}],{margin:{t:10,l:10,r:10,b:10},paper_bgcolor:'transparent',font:{color:'rgb(226,232,240)'}});
+  const ac=json.action_counts||{};plot('actionChart',[{x:Object.keys(ac),y:Object.values(ac),type:'bar'}],{margin:{t:10,l:10,r:10,b:80},paper_bgcolor:'transparent',plot_bgcolor:'transparent',font:{color:'rgb(226,232,240)'},xaxis:{tickangle:-25}});
+  plot('valueChart',[{x:products.slice(0,10).map(x=>x.sku_id),y:products.slice(0,10).map(x=>x.value_at_stake),type:'bar'}],{margin:{t:10,l:65,r:10,b:70},paper_bgcolor:'transparent',plot_bgcolor:'transparent',font:{color:'rgb(226,232,240)'},yaxis:{tickprefix:'₹'}});
+  let rows=json.data||[]; const term=$('search').value.trim().toLowerCase(); if(term)rows=rows.filter(r=>(String(r.sku_name)+' '+String(r.brand)).toLowerCase().includes(term));
+  rows.sort((a,b)=>{let af=String(a.red_flag),bf=String(b.red_flag);return af.localeCompare(bf)||Number(b.risk_score||0)-Number(a.risk_score||0)});
+  $('decisionTable').innerHTML=tableHtml(rows,false);$('productTable').innerHTML=tableHtml(products,true);
+ }catch(e){$('status').textContent='⚠ '+e.message;$('status').className='status warn';$('decisionTable').innerHTML='<div class="error" style="padding:18px">Dashboard data could not be loaded: '+e.message+'</div>';}
 }
-
-async function api(path){
-    const q = params();
-    const url = q ? path + (path.includes("?") ? "&" : "?") + q : path;
-    const response = await fetch(url, {cache:"no-store"});
-
-    if(!response.ok){
-        throw new Error("HTTP " + response.status + " from " + path);
-    }
-
-    return await response.json();
-}
-
-function table(id, rows){
-    const el = document.getElementById(id);
-
-    if(!rows || !rows.length){
-        el.innerHTML = "<p class='muted'>No records available.</p>";
-        return;
-    }
-
-    const cols = Object.keys(rows[0]).slice(0,12);
-
-    let html = "<table><thead><tr>";
-    cols.forEach(c => html += "<th>" + c + "</th>");
-    html += "</tr></thead><tbody>";
-
-    rows.forEach(row => {
-        html += "<tr>";
-
-        cols.forEach(c => {
-            let v = row[c];
-
-            if(v === null || v === undefined) v = "";
-
-            if(String(c).toLowerCase().includes("value")){
-                v = money(v);
-            }
-
-            html += "<td>" + String(v) + "</td>";
-        });
-
-        html += "</tr>";
-    });
-
-    html += "</tbody></table>";
-    el.innerHTML = html;
-}
-
-async function loadAll(){
-    const status = document.getElementById("status");
-    status.textContent = "Loading...";
-    status.className = "muted";
-
-    // allSettled prevents one failed endpoint from blanking the entire dashboard
-    const results = await Promise.allSettled([
-        api("/insights"),
-        api("/forecast?limit=500"),
-        api("/risk?limit=100"),
-        api("/reorder?limit=20"),
-        api("/markdown?limit=20")
-    ]);
-
-    const [insR, forecastR, riskR, reorderR, markdownR] = results;
-
-    const ins = insR.status === "fulfilled" ? insR.value : {};
-    const forecast = forecastR.status === "fulfilled" ? forecastR.value : {data:[]};
-    const risk = riskR.status === "fulfilled" ? riskR.value : {data:[]};
-    const reorder = reorderR.status === "fulfilled" ? reorderR.value : {data:[]};
-    const markdown = markdownR.status === "fulfilled" ? markdownR.value : {data:[]};
-
-    document.getElementById("forecastCount").textContent =
-        Number(ins.forecast_records || 0).toLocaleString("en-IN");
-
-    document.getElementById("stockout").textContent =
-        Number(ins.stockout_count || 0).toLocaleString("en-IN");
-
-    document.getElementById("overstock").textContent =
-        Number(ins.overstock_count || 0).toLocaleString("en-IN");
-
-    document.getElementById("value").textContent =
-        money(ins.total_value_at_stake || 0);
-
-    if(typeof Plotly !== "undefined"){
-        Plotly.newPlot("valueChart",[{
-            x:["Stockout","Overstock"],
-            y:[Number(ins.stockout_value||0),Number(ins.overstock_value||0)],
-            type:"bar"
-        }],{
-            margin:{t:10,l:60,r:20,b:50},
-            yaxis:{tickprefix:"₹"}
-        },{responsive:true});
-
-        const rc = ins.risk_counts || {};
-
-        Plotly.newPlot("riskChart",[{
-            labels:Object.keys(rc),
-            values:Object.values(rc),
-            type:"pie"
-        }],{
-            margin:{t:10,l:10,r:10,b:10}
-        },{responsive:true});
-    }
-
-    const fr = forecast.data || [];
-
-    if(fr.length && fr[0].date && fr[0].prediction !== undefined){
-        Plotly.newPlot("forecastChart",[{
-            x:fr.map(x=>x.date),
-            y:fr.map(x=>Number(x.prediction||0)),
-            type:"scatter",
-            mode:"lines+markers",
-            name:"Forecast"
-        }],{
-            margin:{t:10,l:60,r:20,b:50},
-            xaxis:{title:"Date"},
-            yaxis:{title:"Predicted units"}
-        },{responsive:true});
-    }else{
-        document.getElementById("forecastChart").innerHTML =
-            "<p class='muted'>No forecast data available.</p>";
-    }
-
-    table("reorderTable", reorder.data || []);
-    table("markdownTable", markdown.data || []);
-    table("riskTable", risk.data || []);
-
-    const failed = results.filter(x => x.status === "rejected");
-
-    if(failed.length){
-        status.textContent = "⚠ Dashboard loaded with " + failed.length + " endpoint warning(s)";
-        status.className = "status-error";
-    }else{
-        status.textContent = "✓ API connected";
-        status.className = "status-ok";
-    }
-}
-
-function resetFilters(){
-    document.getElementById("sku").value = "";
-    document.getElementById("store").value = "";
-    loadAll();
-}
-
-loadAll();
+function resetFilters(){['category','sku','store','risk','action','flag'].forEach(id=>$(id).selectedIndex=0);$('ranking').selectedIndex=0;$('search').value='';loadDashboard()}
+loadDashboard();
 </script>
-</body>
-</html>
+</body></html>
 """
-
 
 @app.get("/")
 def dashboard():
