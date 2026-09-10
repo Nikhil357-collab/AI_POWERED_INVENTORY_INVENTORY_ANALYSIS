@@ -419,8 +419,58 @@ def build_dashboard_data():
         base["forecast_profit"] / base["forecast_revenue"] * 100,
         0,
     )
-    base["value_at_stake"] = base["stockout_value"] + base["overstock_value"]
+    #base["value_at_stake"] = base["stockout_value"] + base["overstock_value"]
+    def calculate_financial_metrics(df):
+    df = df.copy()
 
+    # Convert financial columns safely
+    for col in [
+        "stockout_value_at_stake",
+        "overstock_value_at_stake",
+        "unit_price",
+        "cost_price",
+        "shortage_units",
+        "excess_inventory_units"
+    ]:
+        if col not in df.columns:
+            df[col] = 0
+
+        df[col] = pd.to_numeric(
+            df[col],
+            errors="coerce"
+        ).fillna(0)
+
+    # Only VALID inventory decisions contribute to business exposure
+    valid_risk = df["risk_level"].isin([
+        "STOCKOUT",
+        "OVERSTOCK"
+    ])
+
+    # Stockout exposure
+    df["stockout_value_at_stake"] = (
+        df["stockout_value_at_stake"]
+        .where(df["risk_level"] == "STOCKOUT", 0)
+    )
+
+    # Overstock exposure
+    df["overstock_value_at_stake"] = (
+        df["overstock_value_at_stake"]
+        .where(df["risk_level"] == "OVERSTOCK", 0)
+    )
+
+    # Total value at stake
+    df["value_at_stake"] = (
+        df["stockout_value_at_stake"]
+        + df["overstock_value_at_stake"]
+    )
+
+    # DATA_ISSUE must never contribute financial exposure
+    df.loc[
+        ~valid_risk,
+        "value_at_stake"
+    ] = 0
+
+    return df
     # ---------- Transparent decision engine ----------
     risk_type = base["risk_type_clean"].fillna("NORMAL").astype(str).str.upper()
     score = base["risk_score"].clip(lower=0, upper=100)
@@ -624,6 +674,27 @@ def dashboard_data():
                 )
 
         # ---------- KPIs BEFORE table limiting ----------
+        stockout_exposure = df.loc[
+    df["risk_level"] == "STOCKOUT",
+    "stockout_value_at_stake"
+].sum()
+
+overstock_exposure = df.loc[
+    df["risk_level"] == "OVERSTOCK",
+    "overstock_value_at_stake"
+].sum()
+
+total_value_at_stake = (
+    stockout_exposure +
+    overstock_exposure
+) 
+return
+{
+    "stockout_exposure": round(stockout_exposure, 2),
+    "overstock_exposure": round(overstock_exposure, 2),
+    "total_value_at_stake": round(total_value_at_stake, 2)
+}
+        
         kpis = {
             "products": int(base["sku_id"].nunique()),
             "store_sku": int(len(base)),
