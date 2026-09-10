@@ -1,6 +1,7 @@
-from flask import Flask, jsonify, request, render_template_string
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 from pathlib import Path
+from werkzeug.exceptions import HTTPException
 import pandas as pd
 import numpy as np
 import os
@@ -10,7 +11,7 @@ import time
 
 # ============================================================
 # NORTHBAY FORESIGHT
-# DEPLOYMENT-SAFE FLASK API + DASHBOARD
+# DEPLOYMENT-SAFE FLASK API
 # ============================================================
 
 app = Flask(__name__)
@@ -70,10 +71,6 @@ def setup_data_directory():
 
 DATA_DIR = setup_data_directory()
 
-# ============================================================
-# FILE MAP
-# ============================================================
-
 FILES = {
     "forecast": DATA_DIR / "xgboost_predictions.csv",
     "risk": DATA_DIR / "inventory_risk_scores.csv",
@@ -95,10 +92,10 @@ def load_csv(key):
     if key not in FILES: return pd.DataFrame()
     path = FILES[key]
     if not path.is_file(): return pd.DataFrame()
-    if key in _CACHE: return _CACHE[key].copy()
+    if key in _CACHE: return _CACHE[key].copy(deep=True)
     try:
         df = pd.read_csv(path, low_memory=False)
-        _CACHE[key] = df.copy()
+        _CACHE[key] = df.copy(deep=True)
         return df
     except Exception as e:
         print(f"CSV ERROR [{key}]:", repr(e))
@@ -137,10 +134,18 @@ def safe_json(payload, status=200):
     try: return jsonify(payload), status
     except Exception as e: return jsonify({"error": "JSON error", "message": str(e)}), 500
 
+# ============================================================
+# API ENDPOINTS
+# ============================================================
 
-# ============================================================
-# ENDPOINTS RESTORED FOR STREAMLIT
-# ============================================================
+@app.get("/")
+def root_endpoint():
+    """This stops Render from throwing 404/500 errors on health pings."""
+    return safe_json({
+        "status": "online",
+        "service": "NorthBay Foresight Flask Backend API",
+        "endpoints_available": ["/health", "/dashboard_data", "/forecast", "/risk", "/insights", "/metrics"]
+    })
 
 @app.get("/health")
 def health():
@@ -152,20 +157,14 @@ def health():
 
 def generic_csv_endpoint(key):
     df = load_csv(key)
-    if df.empty:
-        return safe_json({"data": [], "count": 0, "message": f"{key} file unavailable"})
-    
-    sku = request.args.get("sku_id", "").strip()
-    store = request.args.get("store_id", "").strip()
-    
+    if df.empty: return safe_json({"data": [], "count": 0, "message": f"{key} file unavailable"})
+    sku, store = request.args.get("sku_id", "").strip(), request.args.get("store_id", "").strip()
     if sku and "sku_id" in df.columns: df = df[df["sku_id"].astype(str).eq(sku)]
     if store and "store_id" in df.columns: df = df[df["store_id"].astype(str).eq(store)]
-        
     return safe_json({"data": records(df.head(limit_value(100, 5000))), "count": int(len(df))})
 
 @app.get("/files")
-def files_endpoint():
-    return safe_json({k: {"exists": p.is_file()} for k, p in FILES.items()})
+def files_endpoint(): return safe_json({k: {"exists": p.is_file()} for k, p in FILES.items()})
 
 @app.get("/forecast")
 def forecast_endpoint(): return generic_csv_endpoint("forecast")
@@ -188,58 +187,53 @@ def metrics_endpoint(): return generic_csv_endpoint("metrics")
 @app.get("/insights")
 def insights_endpoint():
     df = load_csv("insights")
-    if df.empty: return safe_json({})
-    return safe_json({"data": records(df)})
+    return safe_json({"data": records(df)} if not df.empty else {})
 
 @app.get("/sku/<sku_id>")
 def sku_endpoint(sku_id):
     sku_id = str(sku_id)
-    master, forecast, risk = load_csv("sku_master"), load_csv("forecast"), load_csv("risk")
-    
-    product = master[master["sku_id"].astype(str).eq(sku_id)] if not master.empty and "sku_id" in master.columns else pd.DataFrame()
-    f_data = forecast[forecast["sku_id"].astype(str).eq(sku_id)].copy() if not forecast.empty and "sku_id" in forecast.columns else pd.DataFrame()
-    r_data = risk[risk["sku_id"].astype(str).eq(sku_id)].copy() if not risk.empty and "sku_id" in risk.columns else pd.DataFrame()
-
-    return safe_json({
-        "sku_id": sku_id,
-        "product": records(product.head(1)),
-        "forecast": records(f_data.head(500)),
-        "risk": records(r_data.head(100))
-    })
+    m, f, r = load_csv("sku_master"), load_csv("forecast"), load_csv("risk")
+    product = m[m["sku_id"].astype(str).eq(sku_id)] if not m.empty and "sku_id" in m.columns else pd.DataFrame()
+    f_data = f[f["sku_id"].astype(str).eq(sku_id)] if not f.empty and "sku_id" in f.columns else pd.DataFrame()
+    r_data = r[r["sku_id"].astype(str).eq(sku_id)] if not r.empty and "sku_id" in r.columns else pd.DataFrame()
+    return safe_json({"sku_id": sku_id, "product": records(product.head(1)), "forecast": records(f_data.head(500)), "risk": records(r_data.head(100))})
 
 # ============================================================
-# FINANCIAL METRICS
+# FINANCIAL METRICS (PANDAS 3.0 SAFE)
 # ============================================================
 
 def calculate_financial_metrics(df):
-    df = df.copy()
-    numeric_columns = ["stockout_value", "overstock_value", "unit_price", "cost_price", "shortage_units", "excess_units", "stock_on_hand"]
-    for col in numeric_columns:
-        if col not in df.columns: df[col] = 0.0
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    df = df.copy(deep=True)
+    for col in ["stockout_value", "overstock_value", "unit_price", "cost_price", "shortage_units", "excess_units", "stock_on_hand"]:
+        df = df.assign(**{col: num_col(df, col)})
 
     risk_col = first_col(df, ["risk_type", "risk_level"])
-    df["risk_type_clean"] = df[risk_col].fillna("NORMAL").astype(str).str.upper().str.strip() if risk_col else "NORMAL"
+    df = df.assign(risk_type_clean=df[risk_col].fillna("NORMAL").astype(str).str.upper().str.strip() if risk_col else "NORMAL")
 
     calc_stockout = df["shortage_units"] * df["unit_price"]
-    df["stockout_value"] = np.where(df["stockout_value"] > 0, df["stockout_value"], calc_stockout)
-    
     calc_overstock = df["excess_units"] * df["cost_price"]
-    df["overstock_value"] = np.where(df["overstock_value"] > 0, df["overstock_value"], calc_overstock)
+
+    df = df.assign(
+        stockout_value=np.where(df["stockout_value"] > 0, df["stockout_value"], calc_stockout),
+        overstock_value=np.where(df["overstock_value"] > 0, df["overstock_value"], calc_overstock)
+    )
 
     is_stockout = df["risk_type_clean"].str.contains("STOCKOUT", na=False)
     is_overstock = df["risk_type_clean"].str.contains("OVERSTOCK", na=False)
 
-    df["stockout_value"] = np.where(is_stockout, df["stockout_value"], 0.0)
-    df["overstock_value"] = np.where(is_overstock, df["overstock_value"], 0.0)
-    df["value_at_stake"] = df["stockout_value"] + df["overstock_value"]
+    df = df.assign(
+        stockout_value=np.where(is_stockout, df["stockout_value"], 0.0),
+        overstock_value=np.where(is_overstock, df["overstock_value"], 0.0)
+    )
+    df = df.assign(value_at_stake=df["stockout_value"] + df["overstock_value"])
 
     if "forecast_units" in df.columns:
-        df["forecast_revenue"] = df["forecast_units"] * df["unit_price"]
-        df["forecast_profit"] = df["forecast_units"] * (df["unit_price"] - df["cost_price"])
+        df = df.assign(
+            forecast_revenue=df["forecast_units"] * df["unit_price"],
+            forecast_profit=df["forecast_units"] * (df["unit_price"] - df["cost_price"])
+        )
     else:
-        df["forecast_revenue"] = 0.0
-        df["forecast_profit"] = 0.0
+        df = df.assign(forecast_revenue=0.0, forecast_profit=0.0)
 
     return df
 
@@ -254,43 +248,46 @@ def build_dashboard_data():
     if forecast.empty:
         fagg = pd.DataFrame(columns=["store_id", "sku_id", "forecast_units", "actual_units"])
     else:
-        f = forecast.copy()
-        f["sku_id"] = f["sku_id"].astype(str) if "sku_id" in f.columns else "UNKNOWN"
-        f["store_id"] = f["store_id"].astype(str) if "store_id" in f.columns else "ALL"
-        f["prediction"] = num_col(f, "prediction")
-        f["units_sold"] = num_col(f, "units_sold")
+        f = forecast.copy(deep=True)
+        f = f.assign(
+            sku_id=f["sku_id"].astype(str) if "sku_id" in f.columns else "UNKNOWN",
+            store_id=f["store_id"].astype(str) if "store_id" in f.columns else "ALL",
+            prediction=num_col(f, "prediction"),
+            units_sold=num_col(f, "units_sold")
+        )
         fagg = f.groupby(["store_id", "sku_id"], as_index=False).agg(forecast_units=("prediction", "sum"), actual_units=("units_sold", "sum"))
 
     if risk.empty:
         r = pd.DataFrame(columns=["store_id", "sku_id", "risk_type_clean", "risk_score"])
     else:
-        r = risk.copy()
-        r["sku_id"] = r["sku_id"].astype(str) if "sku_id" in r.columns else "UNKNOWN"
-        r["store_id"] = r["store_id"].astype(str) if "store_id" in r.columns else "ALL"
+        r = risk.copy(deep=True)
+        r = r.assign(
+            sku_id=r["sku_id"].astype(str) if "sku_id" in r.columns else "UNKNOWN",
+            store_id=r["store_id"].astype(str) if "store_id" in r.columns else "ALL"
+        )
         risk_col = first_col(r, ["risk_type", "risk_level", "risk_type_clean"])
-        r["risk_type_clean"] = r[risk_col].fillna("NORMAL").astype(str).str.upper().str.strip() if risk_col else "NORMAL"
+        r = r.assign(risk_type_clean=r[risk_col].fillna("NORMAL").astype(str).str.upper().str.strip() if risk_col else "NORMAL")
+        
         for col in ["risk_score", "stockout_value", "overstock_value", "reorder_qty", "shortage_units", "excess_units", "stock_on_hand"]:
-            if col not in r.columns: r[col] = 0.0
-            r[col] = num_col(r, col)
+            r = r.assign(**{col: num_col(r, col)})
         r = r.sort_values("risk_score", ascending=False).drop_duplicates(["store_id", "sku_id"], keep="first")
 
-    if fagg.empty: base = r.copy()
-    elif r.empty: base = fagg.copy()
+    if fagg.empty: base = r.copy(deep=True)
+    elif r.empty: base = fagg.copy(deep=True)
     else: base = fagg.merge(r, on=["store_id", "sku_id"], how="outer")
 
     if base.empty: return (pd.DataFrame(), pd.DataFrame(), {})
-    base["sku_id"] = base["sku_id"].astype(str)
-    base["store_id"] = base["store_id"].astype(str)
+    base = base.assign(sku_id=base["sku_id"].astype(str), store_id=base["store_id"].astype(str))
 
     if not master.empty and "sku_id" in master.columns:
-        m = master.copy()
-        m["sku_id"] = m["sku_id"].astype(str)
+        m = master.copy(deep=True)
+        m = m.assign(sku_id=m["sku_id"].astype(str))
         keep = [col for col in ["sku_id", "sku_name", "category", "subcategory", "brand", "unit_price", "cost_price"] if col in m.columns]
         base = base.merge(m[keep].drop_duplicates("sku_id"), on="sku_id", how="left")
 
     for col in ["sku_name", "category", "subcategory", "brand"]:
-        if col not in base.columns: base[col] = "Unknown"
-        base[col] = base[col].fillna("Unknown").astype(str)
+        if col not in base.columns: base = base.assign(**{col: "Unknown"})
+        base = base.assign(**{col: base[col].fillna("Unknown").astype(str)})
 
     base = calculate_financial_metrics(base)
 
@@ -314,14 +311,15 @@ def build_dashboard_data():
     if "recommended_action" in base.columns:
         existing = base["recommended_action"].fillna("").astype(str).str.upper().str.strip()
         valid_existing = existing.ne("") & ~existing.isin(["NAN", "NONE", "NO ACTION"])
-        base["action"] = np.where(valid_existing, existing, inferred)
+        base = base.assign(action=np.where(valid_existing, existing, inferred))
     else:
-        base["action"] = inferred
+        base = base.assign(action=inferred)
 
-    base["red_flag"] = np.select([score >= 75, score >= 50], ["RED FLAG", "WATCH"], default="OK")
+    base = base.assign(red_flag=np.select([score >= 75, score >= 50], ["RED FLAG", "WATCH"], default="OK"))
 
     product = base.groupby(["sku_id", "sku_name", "category", "subcategory", "brand"], as_index=False).agg(
         forecast_units=("forecast_units", "sum"),
+        actual_units=("actual_units", "sum"),
         forecast_revenue=("forecast_revenue", "sum"),
         forecast_profit=("forecast_profit", "sum"),
         value_at_stake=("value_at_stake", "sum"),
@@ -354,10 +352,10 @@ def dashboard_data():
         base_all, product_all, meta = _DASHBOARD_CACHE
         if base_all.empty: return safe_json({"data": [], "products": [], "meta": meta, "kpis": {}, "count": 0})
 
-        base, product = base_all, product_all
-        category = request.args.get("category", "").strip()
-        sku = request.args.get("sku_id", "").strip()
-        store = request.args.get("store_id", "").strip()
+        base = base_all.copy(deep=True)
+        product = product_all.copy(deep=True)
+        
+        category, sku, store = request.args.get("category", "").strip(), request.args.get("sku_id", "").strip(), request.args.get("store_id", "").strip()
         ranking = request.args.get("ranking", "revenue").strip().lower()
 
         if category:
@@ -386,9 +384,9 @@ def dashboard_data():
         product = product.sort_values(rank_col, ascending=False).head(50)
 
         flag_priority = {"RED FLAG": 0, "WATCH": 1, "OK": 2}
-        base_view = base.copy()
         
-        # FIXED: Removed the bracket assignment causing the Pandas ChainedAssignmentError
+        # PANDAS 3.0 SAFE ASSIGNMENT
+        base_view = base.copy(deep=True)
         base_view = base_view.assign(_flag_priority=base_view["red_flag"].map(flag_priority).fillna(3))
         base_view = base_view.sort_values(["_flag_priority", "risk_score", "value_at_stake"], ascending=[True, False, False]).head(500)
 
@@ -403,9 +401,11 @@ def dashboard_data():
     except Exception as e:
         return safe_json({"error": "Dashboard failed", "message": repr(e)}, 500)
 
-
 @app.errorhandler(Exception)
 def global_error(error):
+    # Gracefully handle 404 errors instead of crashing them into 500s
+    if isinstance(error, HTTPException):
+        return jsonify({"error": error.name, "message": error.description}), error.code
     print("UNHANDLED FLASK ERROR:", repr(error))
     return jsonify({"error": "Internal API error", "message": str(error)}), 500
 
