@@ -37,16 +37,12 @@ _DASHBOARD_BUILD_SECONDS = 0.0
 # ============================================================
 
 def setup_data_directory():
-    """Locate CSV files either inside data/processed/ or data.zip"""
-    
-    # 1. Check normal local / GitHub folder
     if DATA_DIR.exists():
         found = sum((DATA_DIR / filename).is_file() for filename in REQUIRED_FILES)
         if found >= 3:
             print(f"DATA: using {DATA_DIR} ({found}/{len(REQUIRED_FILES)} core files)")
             return DATA_DIR
 
-    # 2. Check data.zip
     if ZIP_FILE.exists():
         print(f"DATA: extracting {ZIP_FILE}")
         try:
@@ -59,7 +55,6 @@ def setup_data_directory():
             print("DATA ZIP ERROR:", repr(e))
             return DATA_DIR
 
-        # Find directory containing maximum core files
         best_dir = EXTRACT_DIR
         best_count = -1
         for root, _, files in os.walk(EXTRACT_DIR):
@@ -72,10 +67,8 @@ def setup_data_directory():
         print(f"DATA: selected {best_dir} ({max(best_count, 0)}/{len(REQUIRED_FILES)} core files)")
         return best_dir
 
-    # 3. Nothing found
     print("DATA WARNING: data.zip not found")
     return DATA_DIR
-
 
 DATA_DIR = setup_data_directory()
 
@@ -104,27 +97,22 @@ for key, path in FILES.items():
     print(f"{key:18s}: {'OK' if path.is_file() else 'MISSING'} -> {path.name}")
 print("=" * 70)
 
-
 # ============================================================
 # SAFE DATA HELPERS
 # ============================================================
 
 def load_csv(key):
-    """Load CSV once and keep it in memory."""
     if key not in FILES:
         return pd.DataFrame()
-    
     path = FILES[key]
     if not path.is_file():
         return pd.DataFrame()
-        
     if key in _CACHE:
         return _CACHE[key].copy()
-        
     try:
         df = pd.read_csv(path, low_memory=False)
         _CACHE[key] = df.copy()
-        print(f"CSV LOADED: {key} -> {len(df):,} rows x {len(df.columns)} columns")
+        print(f"CSV LOADED: {key} -> {len(df):,} rows")
         return df
     except Exception as e:
         print(f"CSV ERROR [{key}]:", repr(e))
@@ -142,50 +130,33 @@ def first_col(df, candidates):
     return None
 
 def clean_value(value):
-    if value is None or value is pd.NA:
-        return None
+    if value is None or value is pd.NA: return None
     if isinstance(value, (pd.Timestamp, np.datetime64)):
-        try:
-            return pd.Timestamp(value).strftime("%Y-%m-%d")
-        except Exception:
-            return None
-    if isinstance(value, np.integer):
-        return int(value)
+        try: return pd.Timestamp(value).strftime("%Y-%m-%d")
+        except: return None
+    if isinstance(value, np.integer): return int(value)
     if isinstance(value, (np.floating, float)):
         try:
-            if not np.isfinite(float(value)):
-                return None
+            if not np.isfinite(float(value)): return None
             return float(value)
-        except Exception:
-            return None
-    if isinstance(value, (np.bool_, bool)):
-        return bool(value)
+        except: return None
+    if isinstance(value, (np.bool_, bool)): return bool(value)
     return value
 
 def records(df):
-    if df is None or df.empty:
-        return []
+    if df is None or df.empty: return []
     output = []
     for row in df.to_dict(orient="records"):
         output.append({str(key): clean_value(value) for key, value in row.items()})
     return output
 
 def limit_value(default=100, maximum=1000):
-    try:
-        value = int(request.args.get("limit", default))
-    except Exception:
-        value = default
-    return max(1, min(value, maximum))
+    try: return max(1, min(int(request.args.get("limit", default)), maximum))
+    except: return default
 
 def safe_json(payload, status=200):
-    try:
-        return jsonify(payload), status
-    except Exception as e:
-        return jsonify({
-            "error": "JSON serialization error",
-            "message": str(e),
-        }), 500
-
+    try: return jsonify(payload), status
+    except Exception as e: return jsonify({"error": "JSON error", "message": str(e)}), 500
 
 # ============================================================
 # HEALTH & FILE STATUS
@@ -195,128 +166,12 @@ def safe_json(payload, status=200):
 def health():
     return safe_json({
         "status": "ok",
-        "service": "NorthBay Foresight Flask",
-        "data_dir": str(DATA_DIR),
         "dashboard_cache": _DASHBOARD_CACHE is not None,
-        "dashboard_build_error": _DASHBOARD_BUILD_ERROR,
-        "dashboard_build_seconds": round(_DASHBOARD_BUILD_SECONDS, 3),
         "files": {key: bool(path.is_file()) for key, path in FILES.items()},
     })
 
-@app.get("/files")
-def files_endpoint():
-    result = {}
-    for key, path in FILES.items():
-        exists = path.is_file()
-        result[key] = {
-            "file": path.name,
-            "path": str(path),
-            "exists": exists,
-            "rows": int(len(load_csv(key))) if exists else 0,
-        }
-    return safe_json(result)
-
-
 # ============================================================
-# DATA API ENDPOINTS
-# ============================================================
-
-@app.get("/forecast")
-def forecast_endpoint():
-    df = load_csv("forecast")
-    if df.empty:
-        return safe_json({"data": [], "count": 0, "message": "Forecast file unavailable"})
-
-    sku = request.args.get("sku_id", "").strip()
-    store = request.args.get("store_id", "").strip()
-
-    if sku and "sku_id" in df.columns:
-        df = df[df["sku_id"].astype(str).eq(sku)]
-    if store and "store_id" in df.columns:
-        df = df[df["store_id"].astype(str).eq(store)]
-
-    return safe_json({
-        "data": records(df.head(limit_value(100, 1000))),
-        "count": int(len(df)),
-    })
-
-@app.get("/risk")
-def risk_endpoint():
-    df = load_csv("risk")
-    if df.empty:
-        return safe_json({"data": [], "count": 0, "message": "Risk file unavailable"})
-
-    sku = request.args.get("sku_id", "").strip()
-    store = request.args.get("store_id", "").strip()
-
-    if sku and "sku_id" in df.columns:
-        df = df[df["sku_id"].astype(str).eq(sku)]
-    if store and "store_id" in df.columns:
-        df = df[df["store_id"].astype(str).eq(store)]
-
-    return safe_json({
-        "data": records(df.head(limit_value(100, 1000))),
-        "count": int(len(df)),
-    })
-
-def generic_csv_endpoint(key):
-    df = load_csv(key)
-    return safe_json({
-        "data": records(df.head(limit_value(100, 1000))),
-        "count": int(len(df)),
-    })
-
-@app.get("/reorder")
-def reorder_endpoint(): return generic_csv_endpoint("reorder")
-
-@app.get("/markdown")
-def markdown_endpoint(): return generic_csv_endpoint("markdown")
-
-@app.get("/metrics")
-def metrics_endpoint(): return generic_csv_endpoint("metrics")
-
-@app.get("/seasonal_metrics")
-def seasonal_metrics_endpoint(): return generic_csv_endpoint("seasonal_metrics")
-
-@app.get("/risk_summary")
-def risk_summary_endpoint(): return generic_csv_endpoint("risk_summary")
-
-@app.get("/decision")
-def decision_endpoint(): return generic_csv_endpoint("decision")
-
-@app.get("/insights")
-def insights_endpoint():
-    df = load_csv("insights")
-    if df.empty:
-        return safe_json({"data": [], "count": 0, "message": "Business insights file unavailable"})
-    return safe_json({"data": records(df.head(100)), "count": int(len(df))})
-
-@app.get("/sku/<sku_id>")
-def sku_endpoint(sku_id):
-    sku_id = str(sku_id)
-    master = load_csv("sku_master")
-    forecast = load_csv("forecast")
-    risk = load_csv("risk")
-
-    product = master[master["sku_id"].astype(str).eq(sku_id)] if not master.empty and "sku_id" in master.columns else pd.DataFrame()
-    forecast_data = forecast[forecast["sku_id"].astype(str).eq(sku_id)].copy() if not forecast.empty and "sku_id" in forecast.columns else pd.DataFrame()
-    risk_data = risk[risk["sku_id"].astype(str).eq(sku_id)].copy() if not risk.empty and "sku_id" in risk.columns else pd.DataFrame()
-
-    if "date" in forecast_data.columns:
-        forecast_data["date"] = pd.to_datetime(forecast_data["date"], errors="coerce")
-        forecast_data = forecast_data.sort_values("date")
-
-    return safe_json({
-        "sku_id": sku_id,
-        "found": bool(not product.empty or not forecast_data.empty or not risk_data.empty),
-        "product": records(product.head(1)),
-        "forecast": records(forecast_data.head(500)),
-        "risk": records(risk_data.head(100)),
-    })
-
-
-# ============================================================
-# FINANCIAL METRICS
+# FINANCIAL METRICS - WITH FIXES
 # ============================================================
 
 def calculate_financial_metrics(df):
@@ -332,16 +187,28 @@ def calculate_financial_metrics(df):
             df[col] = 0.0
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
-    # Risk type
+    # Risk type cleaning
     risk_col = first_col(df, ["risk_type", "risk_level"])
     if risk_col:
         df["risk_type_clean"] = df[risk_col].fillna("NORMAL").astype(str).str.upper().str.strip()
     else:
         df["risk_type_clean"] = "NORMAL"
 
-    # Financial exposure
-    df["stockout_value"] = np.where(df["risk_type_clean"].eq("STOCKOUT"), df["stockout_value"], 0.0)
-    df["overstock_value"] = np.where(df["risk_type_clean"].eq("OVERSTOCK"), df["overstock_value"], 0.0)
+    # Auto-calculate values if the CSV doesn't have them
+    calc_stockout = df["shortage_units"] * df["unit_price"]
+    df["stockout_value"] = np.where(df["stockout_value"] > 0, df["stockout_value"], calc_stockout)
+    
+    calc_overstock = df["excess_units"] * df["cost_price"]
+    df["overstock_value"] = np.where(df["overstock_value"] > 0, df["overstock_value"], calc_overstock)
+
+    # Use 'contains' instead of 'eq' for fuzzy matching
+    is_stockout = df["risk_type_clean"].str.contains("STOCKOUT", na=False)
+    is_overstock = df["risk_type_clean"].str.contains("OVERSTOCK", na=False)
+
+    df["stockout_value"] = np.where(is_stockout, df["stockout_value"], 0.0)
+    df["overstock_value"] = np.where(is_overstock, df["overstock_value"], 0.0)
+
+    # Final Value at Stake
     df["value_at_stake"] = df["stockout_value"] + df["overstock_value"]
 
     # Revenue
@@ -352,14 +219,11 @@ def calculate_financial_metrics(df):
         df["forecast_revenue"] = 0.0
         df["forecast_profit"] = 0.0
 
-    # Profit margin
     df["profit_margin_pct"] = np.where(
         df["forecast_revenue"] > 0,
-        (df["forecast_profit"] / df["forecast_revenue"] * 100),
-        0.0
+        (df["forecast_profit"] / df["forecast_revenue"] * 100), 0.0
     )
     return df
-
 
 # ============================================================
 # DASHBOARD DATA ENGINE
@@ -376,7 +240,7 @@ def build_dashboard_data():
 
     # FORECAST AGGREGATION
     if forecast.empty:
-        fagg = pd.DataFrame(columns=["store_id", "sku_id", "forecast_units", "actual_units", "avg_daily_forecast", "forecast_days"])
+        fagg = pd.DataFrame(columns=["store_id", "sku_id", "forecast_units", "actual_units"])
     else:
         f = forecast.copy()
         f["sku_id"] = f["sku_id"].astype(str) if "sku_id" in f.columns else "UNKNOWN"
@@ -386,9 +250,7 @@ def build_dashboard_data():
 
         fagg = f.groupby(["store_id", "sku_id"], as_index=False).agg(
             forecast_units=("prediction", "sum"),
-            actual_units=("units_sold", "sum"),
-            avg_daily_forecast=("prediction", "mean"),
-            forecast_days=("prediction", "count"),
+            actual_units=("units_sold", "sum")
         )
 
     # RISK DATA
@@ -402,27 +264,18 @@ def build_dashboard_data():
         risk_column = first_col(r, ["risk_type", "risk_level", "risk_type_clean"])
         r["risk_type_clean"] = r[risk_column].fillna("NORMAL").astype(str).str.upper().str.strip() if risk_column else "NORMAL"
 
-        numeric_risk_columns = [
-            "risk_score", "stockout_value", "overstock_value", "reorder_qty",
-            "shortage_units", "excess_units", "stock_on_hand", "reorder_point", "safety_stock"
-        ]
-        for col in numeric_risk_columns:
-            if col not in r.columns:
-                r[col] = 0.0
+        for col in ["risk_score", "stockout_value", "overstock_value", "reorder_qty", "shortage_units", "excess_units", "stock_on_hand"]:
+            if col not in r.columns: r[col] = 0.0
             r[col] = num_col(r, col)
 
         r = r.sort_values("risk_score", ascending=False).drop_duplicates(["store_id", "sku_id"], keep="first")
 
     # MERGE FORECAST + RISK
-    if fagg.empty:
-        base = r.copy()
-    elif r.empty:
-        base = fagg.copy()
-    else:
-        base = fagg.merge(r, on=["store_id", "sku_id"], how="outer")
+    if fagg.empty: base = r.copy()
+    elif r.empty: base = fagg.copy()
+    else: base = fagg.merge(r, on=["store_id", "sku_id"], how="outer")
 
-    if base.empty:
-        return (pd.DataFrame(), pd.DataFrame(), {})
+    if base.empty: return (pd.DataFrame(), pd.DataFrame(), {})
 
     base["sku_id"] = base["sku_id"].astype(str)
     base["store_id"] = base["store_id"].astype(str)
@@ -431,28 +284,13 @@ def build_dashboard_data():
     if not master.empty and "sku_id" in master.columns:
         m = master.copy()
         m["sku_id"] = m["sku_id"].astype(str)
-        master_columns = ["sku_id", "sku_name", "category", "subcategory", "brand", "unit_price", "cost_price"]
-        keep = [col for col in master_columns if col in m.columns]
+        keep = [col for col in ["sku_id", "sku_name", "category", "subcategory", "brand", "unit_price", "cost_price"] if col in m.columns]
         m = m[keep].drop_duplicates("sku_id")
         base = base.merge(m, on="sku_id", how="left")
 
-    # TEXT COLUMNS
     for col in ["sku_name", "category", "subcategory", "brand"]:
-        if col not in base.columns:
-            base[col] = "Unknown"
+        if col not in base.columns: base[col] = "Unknown"
         base[col] = base[col].fillna("Unknown").astype(str)
-
-    # NUMERIC COLUMNS
-    numeric_columns = [
-        "forecast_units", "actual_units", "avg_daily_forecast", "risk_score",
-        "stockout_value", "overstock_value", "reorder_qty", "shortage_units",
-        "excess_units", "stock_on_hand", "reorder_point", "safety_stock",
-        "unit_price", "cost_price"
-    ]
-    for col in numeric_columns:
-        if col not in base.columns:
-            base[col] = 0.0
-        base[col] = num_col(base, col)
 
     # FINANCIAL METRICS
     base = calculate_financial_metrics(base)
@@ -460,35 +298,28 @@ def build_dashboard_data():
     # DECISION ENGINE
     risk_type = base["risk_type_clean"].fillna("NORMAL").astype(str).str.upper().str.strip()
     score = base["risk_score"].clip(lower=0, upper=100)
-    reorder_qty = base["reorder_qty"].clip(lower=0)
-    excess = base["excess_units"].clip(lower=0)
-
-    if "recommended_action" in base.columns:
-        existing = base["recommended_action"].fillna("").astype(str).str.upper().str.strip()
-    else:
-        existing = pd.Series("", index=base.index)
-
-    valid_existing = existing.ne("") & ~existing.isin(["NAN", "NONE", "NO ACTION"])
+    reorder_qty = num_col(base, "reorder_qty").clip(lower=0)
+    excess = num_col(base, "excess_units").clip(lower=0)
 
     inferred = np.select(
         [
-            (risk_type.eq("STOCKOUT") | (reorder_qty > 0)) & (score >= 75),
-            (risk_type.eq("STOCKOUT") | (reorder_qty > 0)),
-            (risk_type.eq("OVERSTOCK") | (excess > 0)) & (score >= 75),
-            (risk_type.eq("OVERSTOCK") | (excess > 0)),
+            (risk_type.str.contains("STOCKOUT") | (reorder_qty > 0)) & (score >= 75),
+            (risk_type.str.contains("STOCKOUT") | (reorder_qty > 0)),
+            (risk_type.str.contains("OVERSTOCK") | (excess > 0)) & (score >= 75),
+            (risk_type.str.contains("OVERSTOCK") | (excess > 0)),
             score >= 50,
         ],
-        [
-            "URGENT REORDER",
-            "REORDER",
-            "URGENT MARKDOWN / SELL NOW",
-            "MARKDOWN / SELL NOW",
-            "WATCH CLOSELY",
-        ],
+        ["URGENT REORDER", "REORDER", "URGENT MARKDOWN / SELL NOW", "MARKDOWN / SELL NOW", "WATCH CLOSELY"],
         default="NO ACTION"
     )
+    
+    if "recommended_action" in base.columns:
+        existing = base["recommended_action"].fillna("").astype(str).str.upper().str.strip()
+        valid_existing = existing.ne("") & ~existing.isin(["NAN", "NONE", "NO ACTION"])
+        base["action"] = np.where(valid_existing, existing, inferred)
+    else:
+        base["action"] = inferred
 
-    base["action"] = np.where(valid_existing, existing, inferred)
     base["red_flag"] = np.select([score >= 75, score >= 50], ["RED FLAG", "WATCH"], default="OK")
 
     # PRODUCT RANKING
@@ -502,20 +333,10 @@ def build_dashboard_data():
         overstock_value=("overstock_value", "sum"),
         max_risk_score=("risk_score", "max"),
     )
+    
+    product["profit_margin_pct"] = np.where(product["forecast_revenue"] > 0, (product["forecast_profit"] / product["forecast_revenue"] * 100), 0.0)
+    product["red_flag"] = np.select([product["max_risk_score"] >= 75, product["max_risk_score"] >= 50], ["RED FLAG", "WATCH"], default="OK")
 
-    product["profit_margin_pct"] = np.where(
-        product["forecast_revenue"] > 0,
-        (product["forecast_profit"] / product["forecast_revenue"] * 100),
-        0.0
-    )
-
-    product["red_flag"] = np.select(
-        [product["max_risk_score"] >= 75, product["max_risk_score"] >= 50],
-        ["RED FLAG", "WATCH"],
-        default="OK"
-    )
-
-    # FILTER OPTIONS
     meta = {
         "categories": sorted(base["category"].dropna().unique().tolist()),
         "stores": sorted(base["store_id"].dropna().unique().tolist()),
@@ -524,27 +345,22 @@ def build_dashboard_data():
         "skus": sorted(base["sku_id"].dropna().unique().tolist())[:10000],
     }
 
-    elapsed = time.time() - started
-    print(f"DASHBOARD BUILT: {elapsed:.2f}s | {len(base):,} store-SKU rows")
-
+    _DASHBOARD_BUILD_SECONDS = time.time() - started
+    print(f"DASHBOARD BUILT: {_DASHBOARD_BUILD_SECONDS:.2f}s | {len(base):,} rows")
     return (base, product, meta)
-
 
 # ============================================================
 # DASHBOARD CACHE
 # ============================================================
 
 def initialize_dashboard_cache():
-    global _DASHBOARD_CACHE, _DASHBOARD_BUILD_ERROR, _DASHBOARD_BUILD_SECONDS
-    started = time.time()
+    global _DASHBOARD_CACHE, _DASHBOARD_BUILD_ERROR
     try:
         _DASHBOARD_CACHE = build_dashboard_data()
         _DASHBOARD_BUILD_ERROR = None
     except Exception as e:
         _DASHBOARD_CACHE = (pd.DataFrame(), pd.DataFrame(), {})
         _DASHBOARD_BUILD_ERROR = repr(e)
-        print("DASHBOARD STARTUP ERROR:", repr(e))
-    _DASHBOARD_BUILD_SECONDS = time.time() - started
 
 initialize_dashboard_cache()
 
@@ -556,32 +372,16 @@ initialize_dashboard_cache()
 def dashboard_data():
     try:
         if _DASHBOARD_CACHE is None:
-            return safe_json({
-                "error": "Dashboard cache unavailable",
-                "message": _DASHBOARD_BUILD_ERROR or "Unknown startup error",
-                "data": [], "products": [], "meta": {}
-            })
+            return safe_json({"error": "Cache unavailable", "message": _DASHBOARD_BUILD_ERROR})
 
         base_all, product_all, meta = _DASHBOARD_CACHE
-
         if base_all.empty:
-            return safe_json({
-                "data": [], "products": [], "meta": meta,
-                "kpis": {
-                    "products": 0, "store_sku": 0, "forecast_units": 0,
-                    "revenue": 0, "profit": 0, "value_at_stake": 0,
-                    "stockout_value": 0, "overstock_value": 0,
-                    "stockout_exposure": 0, "overstock_exposure": 0,
-                    "total_value_at_stake": 0, "red_flags": 0,
-                    "reorder": 0, "markdown": 0,
-                },
-                "count": 0, "warning": _DASHBOARD_BUILD_ERROR,
-            })
+            return safe_json({"data": [], "products": [], "meta": meta, "kpis": {}, "count": 0})
 
         base = base_all
         product = product_all
 
-        # Request filters
+        # Apply Filters
         category = request.args.get("category", "").strip()
         sku = request.args.get("sku_id", "").strip()
         store = request.args.get("store_id", "").strip()
@@ -591,7 +391,6 @@ def dashboard_data():
         search = request.args.get("search", "").strip().casefold()
         ranking = request.args.get("ranking", "revenue").strip().lower()
 
-        # APPLY FILTERS
         if category:
             base = base[base["category"].str.casefold().eq(category.casefold())]
             product = product[product["category"].str.casefold().eq(category.casefold())]
@@ -606,52 +405,26 @@ def dashboard_data():
             base = base[base["action"].str.upper().eq(action)]
         if red_flag:
             base = base[base["red_flag"].str.upper().eq(red_flag)]
-
-        # SEARCH
         if search:
-            search_mask = (
-                base["sku_name"].str.casefold().str.contains(search, regex=False, na=False) |
-                base["brand"].str.casefold().str.contains(search, regex=False, na=False) |
-                base["sku_id"].str.casefold().str.contains(search, regex=False, na=False)
-            )
-            base = base[search_mask]
-            
-            product_mask = (
-                product["sku_name"].str.casefold().str.contains(search, regex=False, na=False) |
-                product["brand"].str.casefold().str.contains(search, regex=False, na=False) |
-                product["sku_id"].str.casefold().str.contains(search, regex=False, na=False)
-            )
-            product = product[product_mask]
+            mask = base["sku_name"].str.casefold().str.contains(search, na=False) | base["sku_id"].str.casefold().str.contains(search, na=False)
+            base = base[mask]
+            p_mask = product["sku_name"].str.casefold().str.contains(search, na=False) | product["sku_id"].str.casefold().str.contains(search, na=False)
+            product = product[p_mask]
 
-        # REBUILD PRODUCT RANKING IF NEEDED
         if store or risk_type or action or red_flag or search:
-            if base.empty:
-                product = product.iloc[0:0]
-            else:
+            if not base.empty:
                 product = base.groupby(["sku_id", "sku_name", "category", "subcategory", "brand"], as_index=False).agg(
                     forecast_units=("forecast_units", "sum"),
                     actual_units=("actual_units", "sum"),
                     forecast_revenue=("forecast_revenue", "sum"),
                     forecast_profit=("forecast_profit", "sum"),
                     value_at_stake=("value_at_stake", "sum"),
-                    stockout_value=("stockout_value", "sum"),
-                    overstock_value=("overstock_value", "sum"),
                     max_risk_score=("risk_score", "max"),
                 )
-                product["profit_margin_pct"] = np.where(
-                    product["forecast_revenue"] > 0,
-                    (product["forecast_profit"] / product["forecast_revenue"] * 100), 0.0
-                )
-                product["red_flag"] = np.select(
-                    [product["max_risk_score"] >= 75, product["max_risk_score"] >= 50],
-                    ["RED FLAG", "WATCH"], default="OK"
-                )
+                product["profit_margin_pct"] = np.where(product["forecast_revenue"] > 0, (product["forecast_profit"] / product["forecast_revenue"] * 100), 0.0)
+                product["red_flag"] = np.select([product["max_risk_score"] >= 75, product["max_risk_score"] >= 50], ["RED FLAG", "WATCH"], default="OK")
 
-        # KPI CALCULATIONS
-        stockout_exposure = base.loc[base["risk_type_clean"].eq("STOCKOUT"), "stockout_value"].sum()
-        overstock_exposure = base.loc[base["risk_type_clean"].eq("OVERSTOCK"), "overstock_value"].sum()
-        total_value_at_stake = stockout_exposure + overstock_exposure
-
+        # KPI Calculations
         kpis = {
             "products": int(base["sku_id"].nunique()),
             "store_sku": int(len(base)),
@@ -659,81 +432,48 @@ def dashboard_data():
             "revenue": float(base["forecast_revenue"].sum()),
             "profit": float(base["forecast_profit"].sum()),
             "value_at_stake": float(base["value_at_stake"].sum()),
-            "stockout_value": float(base["stockout_value"].sum()),
-            "overstock_value": float(base["overstock_value"].sum()),
-            "stockout_exposure": round(float(stockout_exposure), 2),
-            "overstock_exposure": round(float(overstock_exposure), 2),
-            "total_value_at_stake": round(float(total_value_at_stake), 2),
             "red_flags": int((base["red_flag"] == "RED FLAG").sum()),
-            "reorder": int(base["action"].str.contains("REORDER", na=False).sum()),
-            "markdown": int(base["action"].str.contains("MARKDOWN|SELL NOW", regex=True, na=False).sum()),
         }
 
-        # CHART COUNTS
         risk_counts = {str(k): int(v) for k, v in base["risk_type_clean"].value_counts().items()}
         action_counts = {str(k): int(v) for k, v in base["action"].value_counts().items()}
 
-        # PRODUCT RANKING SORT
-        ranking_columns = {
-            "revenue": "forecast_revenue",
-            "profit": "forecast_profit",
-            "low_profit": "forecast_profit",
-            "risk": "max_risk_score",
-            "value": "value_at_stake",
-        }
-        rank_col = ranking_columns.get(ranking, "forecast_revenue")
+        rank_map = {"revenue": "forecast_revenue", "profit": "forecast_profit", "low_profit": "forecast_profit", "risk": "max_risk_score", "value": "value_at_stake"}
+        rank_col = rank_map.get(ranking, "forecast_revenue")
         product = product.sort_values(rank_col, ascending=(ranking == "low_profit")).head(50)
 
-        # DECISION TABLE
-        n = limit_value(100, 1000)
+        # Decision Table prioritization
         flag_priority = {"RED FLAG": 0, "WATCH": 1, "OK": 2}
-        
         base_view = base.copy()
         base_view["_flag_priority"] = base_view["red_flag"].map(flag_priority).fillna(3)
-        base_view = base_view.sort_values(
-            ["_flag_priority", "risk_score", "value_at_stake"], 
-            ascending=[True, False, False]
-        ).head(n).drop(columns=["_flag_priority"], errors="ignore")
+        base_view = base_view.sort_values(["_flag_priority", "risk_score", "value_at_stake"], ascending=[True, False, False]).head(500)
 
-        # OUTPUT COLUMNS
         data_cols = [
-            "store_id", "sku_id", "sku_name", "category", "subcategory", "brand",
-            "forecast_units", "actual_units", "forecast_revenue", "forecast_profit",
-            "profit_margin_pct", "stock_on_hand", "reorder_point", "safety_stock",
-            "risk_type_clean", "risk_score", "priority", "reorder_qty", "shortage_units",
-            "excess_units", "stockout_value", "overstock_value", "value_at_stake",
-            "action", "red_flag"
+            "store_id", "sku_id", "sku_name", "category", "forecast_units", "forecast_revenue", "forecast_profit",
+            "stock_on_hand", "risk_type_clean", "risk_score", "reorder_qty", "shortage_units", "excess_units",
+            "value_at_stake", "action", "red_flag"
         ]
         
-        product_cols = [
-            "sku_id", "sku_name", "category", "subcategory", "brand", "forecast_units",
-            "actual_units", "forecast_revenue", "forecast_profit", "profit_margin_pct",
-            "value_at_stake", "stockout_value", "overstock_value", "max_risk_score", "red_flag"
+        prod_cols = [
+            "sku_id", "sku_name", "category", "forecast_units", "forecast_revenue", "forecast_profit", 
+            "profit_margin_pct", "value_at_stake", "max_risk_score", "red_flag"
         ]
 
         return safe_json({
             "data": records(base_view[[col for col in data_cols if col in base_view.columns]]),
-            "products": records(product[[col for col in product_cols if col in product.columns]]),
+            "products": records(product[[col for col in prod_cols if col in product.columns]]),
             "meta": meta,
             "kpis": kpis,
             "risk_counts": risk_counts,
             "action_counts": action_counts,
             "count": int(len(base)),
-            "cache": True,
-            "build_seconds": round(_DASHBOARD_BUILD_SECONDS, 3),
         })
-
     except Exception as e:
-        print("DASHBOARD REQUEST ERROR:", repr(e))
-        return safe_json({
-            "error": "Dashboard request failed",
-            "message": repr(e),
-            "data": [], "products": [], "meta": {}, "kpis": {}, "count": 0,
-        }, 200)
+        return safe_json({"error": "Dashboard failed", "message": repr(e)}, 500)
 
 
 # ============================================================
-# DASHBOARD HTML (Cleaned up)
+# DASHBOARD HTML (FULL UI RESTORED)
 # ============================================================
 
 DASHBOARD_HTML = r"""
@@ -746,16 +486,9 @@ DASHBOARD_HTML = r"""
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
     <style>
         :root {
-            --bg: rgb(7,12,24);
-            --panel: rgb(15,23,42);
-            --panel2: rgb(20,31,55);
-            --text: rgb(241,245,249);
-            --muted: rgb(148,163,184);
-            --line: rgb(51,65,85);
-            --cyan: rgb(34,211,238);
-            --green: rgb(52,211,153);
-            --red: rgb(248,113,113);
-            --amber: rgb(251,191,36);
+            --bg: rgb(7,12,24); --panel: rgb(15,23,42); --panel2: rgb(20,31,55); --text: rgb(241,245,249);
+            --muted: rgb(148,163,184); --line: rgb(51,65,85); --cyan: rgb(34,211,238);
+            --green: rgb(52,211,153); --red: rgb(248,113,113); --amber: rgb(251,191,36);
         }
         * { box-sizing: border-box; }
         body { margin: 0; font-family: Inter, Segoe UI, Arial, sans-serif; background: linear-gradient(135deg, rgb(5,10,22), rgb(12,20,38), rgb(8,15,31)); color: var(--text); }
@@ -792,19 +525,10 @@ DASHBOARD_HTML = r"""
         .note { color: var(--muted); font-size: 12px; line-height: 1.5; }
         .error { color: var(--red); padding: 18px; }
         
-        @media(max-width:1100px) {
-            .filters { grid-template-columns: repeat(3,1fr); }
-            .kpis { grid-template-columns: repeat(3,1fr); }
-            .grid { grid-template-columns: 1fr; }
-        }
-        @media(max-width:650px) {
-            .wrap { padding: 12px; }
-            .filters { grid-template-columns: 1fr 1fr; }
-            .kpis { grid-template-columns: 1fr 1fr; }
-        }
+        @media(max-width:1100px) { .filters { grid-template-columns: repeat(3,1fr); } .kpis { grid-template-columns: repeat(3,1fr); } .grid { grid-template-columns: 1fr; } }
+        @media(max-width:650px) { .wrap { padding: 12px; } .filters { grid-template-columns: 1fr 1fr; } .kpis { grid-template-columns: 1fr 1fr; } }
     </style>
 </head>
-
 <body>
 <div class="wrap">
     <section class="hero">
@@ -860,7 +584,7 @@ DASHBOARD_HTML = r"""
             <div id="actionChart" class="chart"></div>
         </section>
         <section class="card">
-            <h2>Value at Stake — Top Products</h2>
+            <h2>🚨 Value at Stake — Top Products</h2>
             <div id="valueChart" class="chart"></div>
         </section>
         <section class="card wide">
@@ -887,9 +611,7 @@ DASHBOARD_HTML = r"""
         el.innerHTML = '<option value="">' + placeholder + '</option>';
         (values || []).forEach(v => {
             const option = document.createElement('option');
-            option.value = v;
-            option.textContent = v;
-            el.appendChild(option);
+            option.value = v; option.textContent = v; el.appendChild(option);
         });
     }
 
@@ -900,8 +622,7 @@ DASHBOARD_HTML = r"""
             try {
                 const response = await fetch(url, {cache: 'no-store'});
                 const text = await response.text();
-                if(!response.ok) throw new Error('HTTP ' + response.status + (text ? ' — ' + text.slice(0, 160) : ''));
-                if(!text.trim()) throw new Error('HTTP ' + response.status + ' — empty response');
+                if(!response.ok) throw new Error('HTTP ' + response.status);
                 return JSON.parse(text);
             } catch(error) {
                 if(i === tries - 1) throw error;
@@ -916,7 +637,7 @@ DASHBOARD_HTML = r"""
     }
 
     function tableHtml(rows, product) {
-        if(!rows || !rows.length) return `<div style="padding:20px;color:rgb(148,163,184)">No records match the selected filters.</div>`;
+        if(!rows || !rows.length) return `<div style="padding:20px;color:rgb(148,163,184)">No records match filters.</div>`;
         
         const cols = product 
             ? ['sku_id', 'sku_name', 'category', 'forecast_units', 'forecast_revenue', 'forecast_profit', 'profit_margin_pct', 'value_at_stake', 'max_risk_score', 'red_flag']
@@ -929,15 +650,13 @@ DASHBOARD_HTML = r"""
             cols.forEach(col => {
                 let value = row[col];
                 if(['forecast_revenue', 'forecast_profit', 'value_at_stake'].includes(col)) value = money(value);
-                else if(['forecast_units', 'stock_on_hand', 'reorder_qty', 'shortage_units', 'excess_units'].includes(col)) value = num(value);
-                else if(['risk_score', 'max_risk_score'].includes(col)) value = num(value);
+                else if(['forecast_units', 'stock_on_hand', 'reorder_qty', 'shortage_units', 'excess_units', 'risk_score', 'max_risk_score'].includes(col)) value = num(value);
                 else if(col === 'profit_margin_pct') value = num(value) + '%';
                 
                 const original = String(row[col] ?? '');
                 let cls = '';
-                if(original.includes('RED FLAG') || original.includes('URGENT')) cls = 'red';
+                if(original.includes('RED FLAG') || original.includes('URGENT') || original.includes('REORDER')) cls = 'red';
                 else if(original.includes('MARKDOWN') || original.includes('SELL NOW')) cls = 'amber';
-                else if(original.includes('REORDER')) cls = 'red';
                 
                 html += '<td class="' + cls + '">' + (value ?? '—') + '</td>';
             });
@@ -985,7 +704,7 @@ DASHBOARD_HTML = r"""
             }
 
             const products = json.products || [];
-            const labels = products.slice(0,12).map(x => x.sku_id);
+            const labels = products.slice(0,12).map(x => String(x.sku_name || x.sku_id).substring(0, 15));
             
             plot('productChart', [
                 {x: labels, y: products.slice(0,12).map(x => x.forecast_revenue), type: 'bar', name: 'Revenue'},
@@ -998,7 +717,13 @@ DASHBOARD_HTML = r"""
             const actionCounts = json.action_counts || {};
             plot('actionChart', [{x: Object.keys(actionCounts), y: Object.values(actionCounts), type: 'bar'}], {margin: {t:10, l:10, r:10, b:80}, paper_bgcolor: 'transparent', plot_bgcolor: 'transparent', font: {color: 'rgb(226,232,240)'}, xaxis: {tickangle:-25}});
 
-            plot('valueChart', [{x: products.slice(0,10).map(x => x.sku_id), y: products.slice(0,10).map(x => x.value_at_stake), type: 'bar'}], {margin: {t:10, l:65, r:10, b:70}, paper_bgcolor: 'transparent', plot_bgcolor: 'transparent', font: {color: 'rgb(226,232,240)'}, yaxis: {tickprefix:'₹'}});
+            // Value at Stake Chart - Rendered with fixed red bars and proper names
+            plot('valueChart', [{
+                x: labels.slice(0,10), 
+                y: products.slice(0,10).map(x => x.value_at_stake), 
+                type: 'bar',
+                marker: { color: 'rgb(248,113,113)' }
+            }], {margin: {t:10, l:65, r:10, b:70}, paper_bgcolor: 'transparent', plot_bgcolor: 'transparent', font: {color: 'rgb(226,232,240)'}, yaxis: {tickprefix:'₹'}});
 
             $('decisionTable').innerHTML = tableHtml(json.data || [], false);
             $('productTable').innerHTML = tableHtml(products, true);
