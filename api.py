@@ -10,53 +10,102 @@ app = Flask(__name__)
 CORS(app)
 
 # ============================================================
-# PATHS - WORKS LOCALLY AND ON RENDER
-# ============================================================
+from pathlib import Path
+import zipfile
+import os
+
 BASE_DIR = Path(__file__).resolve().parent
+
+# ---------------------------------------------------------
+# DATA LOCATION
+# ---------------------------------------------------------
 DATA_DIR = BASE_DIR / "data" / "processed"
-
-# Allow Render/local deployments where data may be in data/ directly.
-if not DATA_DIR.exists():
-    DATA_DIR = BASE_DIR / "data"
-
-FILES = {
-    "forecast": "xgboost_predictions.csv",
-    "risk": "inventory_risk_scores.csv",
-    "reorder": "reorder_priority_list.csv",
-    "markdown": "markdown_priority_list.csv",
-    "metrics": "xgmetrics.csv",
-    "sku_master": "sku_master_clean.csv",
-    "summary": "risk_summary.csv",
-}
-
-_CACHE = {}
+ZIP_FILE = BASE_DIR / "data.zip"
+EXTRACT_DIR = BASE_DIR / "_render_data"
 
 
-def csv_path(key):
-    return DATA_DIR / FILES[key]
+def setup_data_directory():
+    """
+    Render/GitHub contains data.zip instead of extracted CSV files.
+    Extract it automatically on application startup.
+    """
+
+    required_files = [
+        "xgboost_predictions.csv",
+        "inventory_risk_scores.csv",
+        "reorder_priority_list.csv",
+        "markdown_priority_list.csv",
+        "risk_summary.csv",
+        "sku_master_clean.csv",
+        "business_insights.csv",
+        "xgmetrics.csv",
+        "seasonal_naive_metrics.csv",
+        "prioritised_decision_list.csv",
+    ]
+
+    # Already extracted and available
+    if DATA_DIR.exists():
+        found = sum((DATA_DIR / f).exists() for f in required_files)
+
+        if found >= 3:
+            print(f"✅ Using existing data directory: {DATA_DIR}")
+            print(f"✅ Found {found}/{len(required_files)} required files")
+            return DATA_DIR
+
+    # Extract ZIP
+    if ZIP_FILE.exists():
+
+        print(f"📦 Found data.zip: {ZIP_FILE}")
+
+        if EXTRACT_DIR.exists():
+            import shutil
+            shutil.rmtree(EXTRACT_DIR)
+
+        EXTRACT_DIR.mkdir(parents=True, exist_ok=True)
+
+        with zipfile.ZipFile(ZIP_FILE, "r") as z:
+            z.extractall(EXTRACT_DIR)
+
+        print(f"✅ data.zip extracted to: {EXTRACT_DIR}")
+
+        # Search recursively for the required CSV files
+        for root, dirs, files in os.walk(EXTRACT_DIR):
+
+            csv_names = set(files)
+
+            if "xgboost_predictions.csv" in csv_names:
+
+                candidate = Path(root)
+
+                found = sum(
+                    (candidate / f).exists()
+                    for f in required_files
+                )
+
+                print(f"🔎 Candidate data directory: {candidate}")
+                print(f"📊 Found {found}/{len(required_files)} required files")
+
+                if found >= 3:
+                    return candidate
+
+        # If files are not all in same folder, search individually
+        print("⚠️ CSV files are not in one common folder.")
+
+        return EXTRACT_DIR
+
+    print("❌ data.zip not found.")
+    print("❌ Expected:", ZIP_FILE)
+
+    return DATA_DIR
 
 
-def load_csv(key, required=False):
-    """Load a CSV safely and cache it for fast Render responses."""
-    path = csv_path(key)
+DATA_DIR = setup_data_directory()
 
-    if not path.exists():
-        if required:
-            raise FileNotFoundError(f"Missing file: {path}")
-        return pd.DataFrame()
-
-    if key in _CACHE:
-        return _CACHE[key].copy()
-
-    try:
-        df = pd.read_csv(path)
-        _CACHE[key] = df
-        return df.copy()
-    except Exception as exc:
-        if required:
-            raise RuntimeError(f"Could not read {path.name}: {exc}")
-        return pd.DataFrame()
-
+print("=" * 60)
+print("NORTHBAY FORESIGHT DATA CONFIGURATION")
+print("BASE_DIR:", BASE_DIR)
+print("DATA_DIR:", DATA_DIR)
+print("=" * 60)
 
 def clean_records(df):
     """Convert pandas values into JSON-safe Python values."""
