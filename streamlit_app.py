@@ -769,4 +769,5 @@ st.markdown("---")
 
 st.caption(
     "NorthBay FORESIGHT | AI-powered Inventory Decision Intelligence"
+    "by NB"
 )
