@@ -675,26 +675,17 @@ def dashboard_data():
 
         # ---------- KPIs BEFORE table limiting ----------
         stockout_exposure = df.loc[
-    df["risk_level"] == "STOCKOUT",
-    "stockout_value_at_stake"
-].sum()
+            df["risk_level"] == "STOCKOUT",
+            "stockout_value_at_stake",
+        ].sum()
 
-overstock_exposure = df.loc[
-    df["risk_level"] == "OVERSTOCK",
-    "overstock_value_at_stake"
-].sum()
+        overstock_exposure = df.loc[
+            df["risk_level"] == "OVERSTOCK",
+            "overstock_value_at_stake",
+        ].sum()
 
-total_value_at_stake = (
-    stockout_exposure +
-    overstock_exposure
-) 
-return
-{
-    "stockout_exposure": round(stockout_exposure, 2),
-    "overstock_exposure": round(overstock_exposure, 2),
-    "total_value_at_stake": round(total_value_at_stake, 2)
-}
-        
+        total_value_at_stake = stockout_exposure + overstock_exposure
+        ###########################################################
         kpis = {
             "products": int(base["sku_id"].nunique()),
             "store_sku": int(len(base)),
@@ -704,6 +695,9 @@ return
             "value_at_stake": float(base["value_at_stake"].sum()),
             "stockout_value": float(base["stockout_value"].sum()),
             "overstock_value": float(base["overstock_value"].sum()),
+            "stockout_exposure": round(stockout_exposure, 2),
+            "overstock_exposure": round(overstock_exposure, 2),
+            "total_value_at_stake": round(total_value_at_stake, 2),
             "red_flags": int((base["red_flag"] == "RED FLAG").sum()),
             "reorder": int(base["action"].str.contains("REORDER", na=False).sum()),
             "markdown": int(base["action"].str.contains("MARKDOWN|SELL NOW", regex=True, na=False).sum()),
@@ -1011,6 +1005,9 @@ loadDashboard();
 def dashboard():
     return render_template_string(DASHBOARD_HTML)
 
+@app.get("/health")
+def health():
+    return jsonify({"status": "ok", "message": "API is healthy"}), 200
 
 # ============================================================
 # GLOBAL ERROR HANDLER
