@@ -114,6 +114,7 @@ print("=" * 60)
 # ============================================================
 
 _CACHE = {}
+_DASHBOARD_CACHE = None
 
 
 def load_csv(key):
@@ -260,7 +261,7 @@ def health():
             "/", "/health", "/files", "/insights", "/metrics",
             "/forecast", "/risk", "/reorder", "/markdown",
             "/sku/<sku_id>", "/seasonal_metrics",
-            "/risk_summary", "/decision"
+            "/risk_summary", "/decision", "/dashboard_data"
         ],
     })
 
@@ -716,34 +717,29 @@ def build_dashboard_data():
         0,
     )
 
-    # ---------- Transparent business action ----------
-    existing_action = base.get("recommended_action", pd.Series("", index=base.index)).fillna("").astype(str).str.upper()
-    risk_type = base.get("risk_type_clean", pd.Series("NORMAL", index=base.index)).fillna("NORMAL").astype(str).str.upper()
+    # ---------- Transparent business action (vectorized for Render speed) ----------
+    existing_action = base.get("recommended_action", pd.Series("", index=base.index)).fillna("").astype(str).str.upper().str.strip()
+    risk_type = base.get("risk_type_clean", pd.Series("NORMAL", index=base.index)).fillna("NORMAL").astype(str).str.upper().str.strip()
     score = _num_series(base, "risk_score")
     reorder_qty = _num_series(base, "reorder_qty")
     excess = _num_series(base, "excess_units")
 
-    def infer_action(row):
-        action = str(row.get("recommended_action", "")).upper().strip()
-        if action and action not in {"NAN", "NONE", "NO ACTION"}:
-            return action
-        rt = str(row.get("risk_type_clean", "NORMAL")).upper()
-        rs = float(row.get("risk_score", 0) or 0)
-        rq = float(row.get("reorder_qty", 0) or 0)
-        ex = float(row.get("excess_units", 0) or 0)
-        if rt == "STOCKOUT" or rq > 0:
-            return "URGENT REORDER" if rs >= 75 else "REORDER"
-        if rt == "OVERSTOCK" or ex > 0:
-            return "URGENT MARKDOWN" if rs >= 75 else "MARKDOWN / SELL NOW"
-        if rs >= 50:
-            return "WATCH CLOSELY"
-        return "NO ACTION"
+    valid_existing = existing_action.ne("") & ~existing_action.isin(["NAN", "NONE", "NO ACTION"])
+    urgent_reorder = (risk_type.eq("STOCKOUT") | reorder_qty.gt(0)) & score.ge(75)
+    normal_reorder = (risk_type.eq("STOCKOUT") | reorder_qty.gt(0))
+    urgent_markdown = (risk_type.eq("OVERSTOCK") | excess.gt(0)) & score.ge(75)
+    normal_markdown = (risk_type.eq("OVERSTOCK") | excess.gt(0))
 
-    base["action"] = base.apply(infer_action, axis=1)
+    inferred = np.select(
+        [urgent_reorder, normal_reorder, urgent_markdown, normal_markdown, score.ge(50)],
+        ["URGENT REORDER", "REORDER", "URGENT MARKDOWN", "MARKDOWN / SELL NOW", "WATCH CLOSELY"],
+        default="NO ACTION",
+    )
+    base["action"] = np.where(valid_existing, existing_action, inferred)
     base["red_flag"] = np.where(
-        (risk_type.isin(["STOCKOUT", "OVERSTOCK"])) | (score >= 75),
+        risk_type.isin(["STOCKOUT", "OVERSTOCK"]) | score.ge(75),
         "RED FLAG",
-        np.where(score >= 50, "WATCH", "OK"),
+        np.where(score.ge(50), "WATCH", "OK"),
     )
     base["value_at_stake"] = _num_series(base, "stockout_value") + _num_series(base, "overstock_value")
 
@@ -773,9 +769,12 @@ def build_dashboard_data():
 
 @app.get("/dashboard_data")
 def dashboard_data():
-    """Single endpoint used by the Flask dashboard; avoids many browser API calls."""
+    """Single cached endpoint used by the Flask dashboard."""
+    global _DASHBOARD_CACHE
     try:
-        base, product, meta = build_dashboard_data()
+        if _DASHBOARD_CACHE is None:
+            _DASHBOARD_CACHE = build_dashboard_data()
+        base, product, meta = _DASHBOARD_CACHE
         if base.empty:
             return jsonify({"data": [], "products": [], "meta": meta, "count": 0})
 
@@ -949,13 +948,25 @@ function tableHtml(rows, product=false){
  return h+'</tbody></table>';
 }
 function plot(id,data,layout){if(typeof Plotly==='undefined'){return} Plotly.newPlot(id,data,layout,{responsive:true,displayModeBar:false});}
+async function fetchJson(url,attempt=0){
+ const res=await fetch(url,{cache:'no-store'});
+ const text=await res.text();
+ if(!res.ok){
+   if(attempt<2){await new Promise(r=>setTimeout(r,1200*(attempt+1)));return fetchJson(url,attempt+1);}
+   throw new Error('HTTP '+res.status+(text?' — '+text.slice(0,180):' — empty response'));
+ }
+ if(!text.trim()){
+   if(attempt<2){await new Promise(r=>setTimeout(r,1200*(attempt+1)));return fetchJson(url,attempt+1);}
+   throw new Error('Server returned an empty response');
+ }
+ try{return JSON.parse(text)}catch(e){throw new Error('Server returned invalid JSON: '+text.slice(0,180))}
+}
 async function loadDashboard(){
  const q=new URLSearchParams(); ['category','sku','store','risk','action','flag','ranking'].forEach(id=>{let v=$(id).value;if(v)q.set(id==='risk'?'risk_type':id==='flag'?'red_flag':id==='sku'?'sku_id':id,v)});
  q.set('limit','1000');
- $('status').textContent='Loading filtered data…'; $('status').className='status';
+ $('status').textContent='Loading dashboard data…'; $('status').className='status';
  try{
-  const res=await fetch('/dashboard_data?'+q.toString()); const json=await res.json();
-  if(!res.ok)throw new Error('HTTP '+res.status);
+  const json=await fetchJson('/dashboard_data?'+q.toString());
   if(json.error)throw new Error(json.message||json.error);
   const k=json.kpis||{}; setK('kProducts',num(k.products));setK('kUnits',num(k.forecast_units));setK('kRevenue',money(k.revenue));setK('kProfit',money(k.profit));setK('kStake',money(k.value_at_stake));setK('kFlags',num(k.red_flags));
   $('status').textContent='✓ Dashboard connected • '+num(json.count)+' filtered store-SKU records'; $('status').className='status';
