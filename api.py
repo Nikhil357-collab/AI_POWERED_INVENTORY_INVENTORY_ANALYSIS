@@ -10,6 +10,7 @@ app = Flask(__name__)
 CORS(app)
 
 # ============================================================
+# PATHS - WORKS LOCALLY AND ON RENDER
 from pathlib import Path
 import zipfile
 import os
@@ -101,6 +102,25 @@ def setup_data_directory():
 
 DATA_DIR = setup_data_directory()
 
+# Logical dataset names used by the API and their resolved CSV paths.
+FILES = {
+    "forecast": DATA_DIR / "xgboost_predictions.csv",
+    "risk": DATA_DIR / "inventory_risk_scores.csv",
+    "reorder": DATA_DIR / "reorder_priority_list.csv",
+    "markdown": DATA_DIR / "markdown_priority_list.csv",
+    "risk_summary": DATA_DIR / "risk_summary.csv",
+    "sku_master": DATA_DIR / "sku_master_clean.csv",
+    "insights": DATA_DIR / "business_insights.csv",
+    "metrics": DATA_DIR / "xgmetrics.csv",
+    "seasonal_metrics": DATA_DIR / "seasonal_naive_metrics.csv",
+    "decision": DATA_DIR / "prioritised_decision_list.csv",
+}
+
+
+def csv_path(key):
+    """Return the configured CSV path for a dataset key."""
+    return FILES[key]
+
 print("=" * 60)
 print("NORTHBAY FORESIGHT DATA CONFIGURATION")
 print("BASE_DIR:", BASE_DIR)
@@ -180,6 +200,45 @@ def number(df, col):
 
 # ============================================================
 # BASIC ROUTES
+# ---------------------------------------------------------
+# CSV LOADER
+# ---------------------------------------------------------
+
+_CACHE = {}
+
+
+def load_csv(key):
+    """Load a CSV file safely from the configured data directory."""
+
+    if key not in FILES:
+        print(f"❌ Unknown data key: {key}")
+        return pd.DataFrame()
+
+    path = FILES[key]
+
+    if not path.exists():
+        print(f"⚠️ File not found for {key}: {path}")
+        return pd.DataFrame()
+
+    # Return cached dataframe if already loaded
+    if key in _CACHE:
+        return _CACHE[key].copy()
+
+    try:
+        df = pd.read_csv(path)
+
+        print(
+            f"✅ Loaded {key}: "
+            f"{len(df):,} rows × {len(df.columns)} columns"
+        )
+
+        _CACHE[key] = df.copy()
+
+        return df
+
+    except Exception as e:
+        print(f"❌ Failed to load {key}: {e}")
+        return pd.DataFrame()
 # ============================================================
 
 @app.get("/health")
@@ -231,6 +290,8 @@ def insights():
         "overstock_value": 0.0,
         "total_value_at_stake": 0.0,
         "risk_counts": {},
+        "percentage_stockout": 0.0,
+        "percentage_overstock": 0.0,
     }
 
     if not risk.empty:
@@ -388,8 +449,29 @@ def sku(sku_id):
         "forecast": clean_records(f),
         "risk": clean_records(r),
     })
+   
+@app.get("/seasonal_metrics")
+def seasonal_metrics():
+    df = load_csv("seasonal_metrics")
+    return jsonify({
+        "data": clean_records(df),
+        "count": int(len(df))
+    })
+@app.get("/risk_summary")
+def risk_summary():
+    df = load_csv("risk_summary")
+    return jsonify({
+        "data": clean_records(df),
+        "count": int(len(df))
+    })
 
-
+@app.get("/decision")
+def decision():
+    df = load_csv("decision")
+    return jsonify({
+        "data": clean_records(df),
+        "count": int(len(df))
+    })
 # ============================================================
 # SIMPLE FLASK DASHBOARD
 # This removes the need for Streamlit for submission.
